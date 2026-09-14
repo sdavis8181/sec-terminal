@@ -75,7 +75,6 @@ def calculate_fcf_from_raw(df):
 @st.cache_data(ttl=86400)
 def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
-  # Try 10-Q first; fall back or include other primary quarterly/annual views if available
   filings = company.get_filings(form="10-Q")
   if len(filings) < 4:
     filings = company.get_filings()[:40]
@@ -184,6 +183,7 @@ def fetch_and_parse_ticker(ticker):
               "Basic and diluted",
               "Diluted",
               "Earnings per share - diluted",
+              "Diluted earnings (loss) per share",
           ],
       )
       diluted_shares = parse_multi_val(
@@ -220,6 +220,37 @@ def fetch_and_parse_ticker(ticker):
       continue
 
   df = pd.DataFrame(records).sort_values("Period").drop_duplicates(subset=["Period"]).reset_index(drop=True)
+
+  # Fallback augmentation via yfinance for IFRS / Foreign filers where SEC XBRL labels differ
+  try:
+    tk = yf.Ticker(ticker)
+    q_inc = tk.quarterly_income_stmt
+    q_bal = tk.quarterly_balance_sheet
+    if q_inc is not None and not q_inc.empty:
+      for col_date in df["Period"]:
+        idx = df[df["Period"] == col_date].index[0]
+        # Match nearest yfinance quarter column
+        for yf_col in q_inc.columns:
+          if str(yf_col)[:7] == col_date[:7]:
+            if pd.isna(df.loc[idx, "Diluted_EPS"]):
+              for eps_key in ["Diluted EPS", "Basic EPS"]:
+                if eps_key in q_inc.index:
+                  val = q_inc.loc[eps_key, yf_col]
+                  if pd.notna(val):
+                    df.loc[idx, "Diluted_EPS"] = float(val)
+                    break
+        if q_bal is not None and not q_bal.empty:
+          for yf_col in q_bal.columns:
+            if str(yf_col)[:7] == col_date[:7]:
+              if pd.isna(df.loc[idx, "Diluted_Shares"]):
+                for share_key in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+                  if share_key in q_bal.index:
+                    val = q_bal.loc[share_key, yf_col]
+                    if pd.notna(val):
+                      df.loc[idx, "Diluted_Shares"] = float(val)
+                      break
+  except Exception:
+    pass
 
   # Derived metrics
   df["Revenue_B"] = df["Revenue"] / 1e9
@@ -290,7 +321,6 @@ try:
     df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(df_raw_full["YF_Shares_M"])
     df_raw_full["Share_Dilution_YoY_%"] = df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
 
-  # Clean slice
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
