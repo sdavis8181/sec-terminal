@@ -16,9 +16,8 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Terminal")
 st.markdown(
-    "Enter a stock ticker to pull live GAAP/IFRS financial statements,"
-    " disaggregate standalone quarterly cash flows, and generate executive"
-    " growth charts."
+    "Enter a stock ticker to pull GAAP/IFRS financial statements, disaggregate"
+    " standalone quarterly cash flows, and generate executive growth charts."
 )
 
 with st.sidebar:
@@ -280,7 +279,6 @@ def fetch_and_parse_ticker(ticker):
                 "Share Issued",
                 "Common Stock",
                 "Diluted Average Shares",
-                "Share Issued",
             ]
         )
         if pd.isna(shares):
@@ -295,15 +293,10 @@ def fetch_and_parse_ticker(ticker):
             q_cf, [
                 "Operating Cash Flow",
                 "Cash Flow From Continuing Operating Activities",
-                "Operating Cash Flow",
             ]
         )
         capex = get_val(
-            q_cf, [
-                "Capital Expenditure",
-                "Purchase Of Property And Equipment",
-                "Capital Expenditures",
-            ]
+            q_cf, ["Capital Expenditure", "Purchase Of Property And Equipment"]
         )
 
         records.append({
@@ -324,17 +317,11 @@ def fetch_and_parse_ticker(ticker):
       .reset_index(drop=True)
   )
 
-  # Check if yfinance info has trailing metrics to patch foreign filers if quarterly tables are sparse
-  try:
-    tk_info = yf.Ticker(ticker).info
-    info_eps = tk_info.get("trailingEps")
-    info_shares = tk_info.get("sharesOutstanding")
-    if pd.notna(info_eps) and df["Diluted_EPS"].isna().all():
-      df["Diluted_EPS"] = info_eps
-    if pd.notna(info_shares) and df["Diluted_Shares"].isna().all():
-      df["Diluted_Shares"] = info_shares
-  except Exception:
-    pass
+  # Ensure Diluted_EPS and Diluted_Shares are time-series arrays
+  if "Diluted_EPS" in df.columns:
+    df["Diluted_EPS"] = pd.to_numeric(df["Diluted_EPS"], errors="coerce")
+  if "Diluted_Shares" in df.columns:
+    df["Diluted_Shares"] = pd.to_numeric(df["Diluted_Shares"], errors="coerce")
 
   # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
