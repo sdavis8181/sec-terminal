@@ -77,7 +77,7 @@ def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
   filings_10q = company.get_filings(form="10-Q")[:40]
 
-  def parse_multi_val(df, keywords):
+  def parse_multi_val(df, keywords, min_val=None):
     if df is None:
       return np.nan
     for kw in keywords:
@@ -95,7 +95,10 @@ def fetch_and_parse_ticker(ticker):
                 .replace(")", "")
             )
             try:
-              return float(val_str)
+              val = float(val_str)
+              if min_val is not None and val < min_val:
+                continue
+              return val
             except:
               pass
     return np.nan
@@ -156,6 +159,7 @@ def fetch_and_parse_ticker(ticker):
     eps_diluted = parse_multi_val(
         inc_df,
         [
+            "Diluted",
             "Diluted earnings per share",
             "Earnings per share, diluted",
             "Diluted (in USD per share)",
@@ -165,12 +169,13 @@ def fetch_and_parse_ticker(ticker):
     diluted_shares = parse_multi_val(
         inc_df,
         [
-            "Weighted average shares diluted",
-            "Weighted average number of shares outstanding, diluted",
-            "Weighted average shares outstanding, diluted",
             "Weighted-average shares outstanding, diluted",
+            "Weighted average shares outstanding, diluted",
+            "Weighted average number of shares outstanding, diluted",
+            "Weighted average shares diluted",
             "Diluted shares",
         ],
+        min_val=100000,  # Ensure we don't accidentally match EPS values
     )
 
     ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
@@ -522,9 +527,10 @@ try:
 
   # Valuation Chart 4: Diluted Share Count & Capex (Dual Axis)
   ax_p4 = axes2[1, 1]
+  v_shares = df_raw.dropna(subset=["Diluted_Shares_M"])
   ax_p4.plot(
-      df_raw["Period"],
-      df_raw["Diluted_Shares_M"],
+      v_shares["Period"],
+      v_shares["Diluted_Shares_M"],
       color="#2563EB",
       marker="o",
       linewidth=2,
