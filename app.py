@@ -175,7 +175,7 @@ def fetch_and_parse_ticker(ticker):
             "Weighted average shares diluted",
             "Diluted shares",
         ],
-        min_val=100000,  # Ensure we don't accidentally match EPS values
+        min_val=100000,
     )
 
     ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
@@ -258,11 +258,11 @@ try:
     df_raw["P_E_TTM"] = current_price / df_raw["TTM_EPS"]
     df_raw["P_E_Ann"] = current_price / df_raw["Ann_EPS"]
 
-    merged_fcf = df_raw[["Period"]].merge(
-        df_fcf[["Period", "FCF"]], on="Period", how="left"
+    merged_fcf = df_fcf[["Period"]].merge(
+        df_raw[["Period", "Revenue"]], on="Period", how="left"
     )
-    df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
-    df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
+    df_fcf["TTM_FCF"] = df_fcf["FCF"].rolling(4).sum()
+    df_fcf["FCF_Yield_%"] = (df_fcf["TTM_FCF"] / market_cap) * 100
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
@@ -351,7 +351,7 @@ try:
   l2s, lb2s = ax2_sub.get_legend_handles_labels()
   ax2.legend(l2 + l2s, lb2 + lb2s, loc="upper left", fontsize=6.5)
 
-  # 3. FCF
+  # 3. FCF (with FCF Yield plotted on twin axis)
   ax3 = axes[1, 0]
   v_fcf = df_fcf.tail(lookback_quarters).reset_index(drop=True)
   v_fcf_clean = v_fcf.dropna(subset=["FCF_B"])
@@ -364,7 +364,7 @@ try:
       label="Free Cash Flow ($B)",
   )
   ax3.set_title(
-      "Standalone Free Cash Flow ($B) & Growth",
+      "Standalone Free Cash Flow ($B), Growth & FCF Yield",
       fontweight="bold",
       fontsize=10.5,
   )
@@ -388,11 +388,21 @@ try:
       linewidth=1.2,
       label="QoQ Growth (%)",
   )
-  ax3_sub.set_ylabel("Growth (%)", fontsize=8)
+  if "FCF_Yield_%" in v_fcf_clean.columns:
+    ax3_sub.plot(
+        v_fcf_clean["Period"],
+        v_fcf_clean["FCF_Yield_%"],
+        color="#F59E0B",
+        marker="^",
+        linestyle="-.",
+        linewidth=2,
+        label="FCF Yield (%)",
+    )
+  ax3_sub.set_ylabel("Growth (%) / Yield (%)", fontsize=8)
   ax3_sub.grid(False)
   l3, lb3 = ax3.get_legend_handles_labels()
   l3s, lb3s = ax3_sub.get_legend_handles_labels()
-  ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6.5)
+  ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6)
 
   # 4. Margins (Line Chart)
   ax4 = axes[1, 1]
