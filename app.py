@@ -77,7 +77,6 @@ def fetch_and_parse_ticker(ticker):
   records = []
   edgar_success = False
 
-  # Try SEC EDGAR first
   try:
     company = Company(ticker)
     filings = company.get_filings(form="10-Q")
@@ -215,7 +214,7 @@ def fetch_and_parse_ticker(ticker):
           )
 
         records.append({
-            "Period": str(f.period_of_report),
+            "Period": str(f.period_of_report)[:10],
             "Revenue": rev,
             "Operating_Income": op_inc,
             "Net_Income": net_inc,
@@ -231,51 +230,46 @@ def fetch_and_parse_ticker(ticker):
   except Exception:
     edgar_success = False
 
-  # If EDGAR returned nothing or insufficient data (e.g. Foreign / IFRS / 20-F filer), pull via yfinance quarterly statements
-  if not edgar_success or len(records) < 4:
-    records = []
+  # Primary or secondary pull directly from yfinance quarterly data (reliable for IFRS / Foreign / US)
+  try:
     tk = yf.Ticker(ticker)
     q_inc = tk.quarterly_income_stmt
     q_cf = tk.quarterly_cashflow
     q_bal = tk.quarterly_balance_sheet
-    if q_inc is not None and not q_inc.empty:
-      dates = q_inc.columns
-      for date_col in dates:
-        period_str = str(date_col)[:10]
 
-        def get_yf_row(df_q, possible_names):
+    if q_inc is not None and not q_inc.empty:
+      yf_records = []
+      for date_col in q_inc.columns:
+        p_str = str(date_col)[:10]
+
+        def get_val(df_q, keys):
           if df_q is None or df_q.empty:
             return np.nan
-          for name in possible_names:
-            if name in df_q.index:
-              v = df_q.loc[name, date_col]
+          for k in keys:
+            if k in df_q.index:
+              v = df_q.loc[k, date_col]
               if pd.notna(v):
                 return float(v)
           return np.nan
 
-        rev = get_yf_row(
+        rev = get_val(
             q_inc, ["Total Revenue", "Total Revenues", "Operating Revenue", "Revenue"]
         )
-        op_inc = get_yf_row(
-            q_inc, ["Operating Income", "EBIT", "Operating Profit"]
-        )
-        net_inc = get_yf_row(
-            q_inc, ["Net Income", "Net Income Common Stockholders"]
-        )
-        eps_dil = get_yf_row(q_inc, ["Diluted EPS", "Basic EPS"])
-
-        ocf = get_yf_row(
-            q_cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]
-        )
-        capex = get_yf_row(
-            q_cf, ["Capital Expenditure", "Purchase Of Property And Equipment"]
-        )
-        shares = get_yf_row(
+        op_inc = get_val(q_inc, ["Operating Income", "EBIT", "Operating Profit"])
+        net_inc = get_val(q_inc, ["Net Income", "Net Income Common Stockholders"])
+        eps_dil = get_val(q_inc, ["Diluted EPS", "Basic EPS"])
+        shares = get_val(
             q_bal, ["Ordinary Shares Number", "Share Issued", "Common Stock"]
         )
+        ocf = get_val(
+            q_cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]
+        )
+        capex = get_val(
+            q_cf, ["Capital Expenditure", "Purchase Of Property And Equipment"]
+        )
 
-        records.append({
-            "Period": period_str,
+        yf_records.append({
+            "Period": p_str,
             "Revenue": rev,
             "Operating_Income": op_inc,
             "Net_Income": net_inc,
@@ -285,14 +279,39 @@ def fetch_and_parse_ticker(ticker):
             "Capex": capex,
         })
 
-  df = (
-      pd.DataFrame(records)
-      .sort_values("Period")
-      .drop_duplicates(subset=["Period"])
-      .reset_index(drop=True)
-  )
+      df_yf = (
+          pd.DataFrame(yf_records)
+          .sort_values("Period")
+          .drop_duplicates(subset=["Period"])
+          .reset_index(drop=True)
+      )
 
-  # Fill missing shares from Net Income / EPS if needed
+      # If EDGAR had fewer records than yfinance, use yfinance dataframe directly
+      if not edgar_success or len(df_yf) > len(records):
+        df = df_yf
+      else:
+        df = (
+            pd.DataFrame(records)
+            .sort_values("Period")
+            .drop_duplicates(subset=["Period"])
+            .reset_index(drop=True)
+        )
+    else:
+      df = (
+          pd.DataFrame(records)
+          .sort_values("Period")
+          .drop_duplicates(subset=["Period"])
+          .reset_index(drop=True)
+      )
+  except Exception:
+    df = (
+        pd.DataFrame(records)
+        .sort_values("Period")
+        .drop_duplicates(subset=["Period"])
+        .reset_index(drop=True)
+    )
+
+  # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
   df["Diluted_Shares"] = df["Diluted_Shares"].fillna(implied_shares)
 
