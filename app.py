@@ -14,16 +14,17 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("Institutional SEC XBRL Financial Dashboard")
+st.title("Institutional SEC XBRL Financial Terminal")
 st.markdown(
-    "Enter a stock ticker to pull GAAP/IFRS financial statements, disaggregate"
-    " standalone quarterly cash flows, and generate executive growth charts."
+    "Enter a stock ticker to pull live GAAP/IFRS financial statements,"
+    " disaggregate standalone quarterly cash flows, and generate executive"
+    " growth charts."
 )
 
 with st.sidebar:
   st.header("Terminal Controls")
   ticker_symbol = (
-      st.text_input("Stock Ticker", value="MELI", max_chars=10)
+      st.text_input("Stock Ticker", value="UBER", max_chars=10)
       .strip()
       .upper()
   )
@@ -77,6 +78,7 @@ def fetch_and_parse_ticker(ticker):
   records = []
   edgar_success = False
 
+  # Try U.S. SEC EDGAR 10-Q path first
   try:
     company = Company(ticker)
     filings = company.get_filings(form="10-Q")
@@ -230,15 +232,15 @@ def fetch_and_parse_ticker(ticker):
   except Exception:
     edgar_success = False
 
-  # Primary or secondary pull directly from yfinance quarterly data (reliable for IFRS / Foreign / US)
-  try:
+  # If EDGAR returned nothing (Foreign / IFRS / 20-F filer like MELI or NU), pull via yfinance quarterly statements
+  if not edgar_success or len(records) < 4:
+    records = []
     tk = yf.Ticker(ticker)
     q_inc = tk.quarterly_income_stmt
     q_cf = tk.quarterly_cashflow
     q_bal = tk.quarterly_balance_sheet
 
     if q_inc is not None and not q_inc.empty:
-      yf_records = []
       for date_col in q_inc.columns:
         p_str = str(date_col)[:10]
 
@@ -278,6 +280,7 @@ def fetch_and_parse_ticker(ticker):
                 "Share Issued",
                 "Common Stock",
                 "Diluted Average Shares",
+                "Share Issued",
             ]
         )
         if pd.isna(shares):
@@ -292,13 +295,18 @@ def fetch_and_parse_ticker(ticker):
             q_cf, [
                 "Operating Cash Flow",
                 "Cash Flow From Continuing Operating Activities",
+                "Operating Cash Flow",
             ]
         )
         capex = get_val(
-            q_cf, ["Capital Expenditure", "Purchase Of Property And Equipment"]
+            q_cf, [
+                "Capital Expenditure",
+                "Purchase Of Property And Equipment",
+                "Capital Expenditures",
+            ]
         )
 
-        yf_records.append({
+        records.append({
             "Period": p_str,
             "Revenue": rev,
             "Operating_Income": op_inc,
@@ -309,36 +317,24 @@ def fetch_and_parse_ticker(ticker):
             "Capex": capex,
         })
 
-      df_yf = (
-          pd.DataFrame(yf_records)
-          .sort_values("Period")
-          .drop_duplicates(subset=["Period"])
-          .reset_index(drop=True)
-      )
+  df = (
+      pd.DataFrame(records)
+      .sort_values("Period")
+      .drop_duplicates(subset=["Period"])
+      .reset_index(drop=True)
+  )
 
-      if not edgar_success or len(df_yf) > len(records):
-        df = df_yf
-      else:
-        df = (
-            pd.DataFrame(records)
-            .sort_values("Period")
-            .drop_duplicates(subset=["Period"])
-            .reset_index(drop=True)
-        )
-    else:
-      df = (
-          pd.DataFrame(records)
-          .sort_values("Period")
-          .drop_duplicates(subset=["Period"])
-          .reset_index(drop=True)
-      )
+  # Check if yfinance info has trailing metrics to patch foreign filers if quarterly tables are sparse
+  try:
+    tk_info = yf.Ticker(ticker).info
+    info_eps = tk_info.get("trailingEps")
+    info_shares = tk_info.get("sharesOutstanding")
+    if pd.notna(info_eps) and df["Diluted_EPS"].isna().all():
+      df["Diluted_EPS"] = info_eps
+    if pd.notna(info_shares) and df["Diluted_Shares"].isna().all():
+      df["Diluted_Shares"] = info_shares
   except Exception:
-    df = (
-        pd.DataFrame(records)
-        .sort_values("Period")
-        .drop_duplicates(subset=["Period"])
-        .reset_index(drop=True)
-    )
+    pass
 
   # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
