@@ -16,15 +16,14 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Dashboard")
 st.markdown(
-    "Enter a stock ticker to pull live GAAP/IFRS financial statements,"
-    " disaggregate standalone quarterly cash flows, and generate executive"
-    " growth charts."
+    "Enter a stock ticker to pull GAAP/IFRS financial statements, disaggregate"
+    " standalone quarterly cash flows, and generate executive growth charts."
 )
 
 with st.sidebar:
   st.header("Terminal Controls")
   ticker_symbol = (
-      st.text_input("Stock Ticker", value="UBER", max_chars=10)
+      st.text_input("Stock Ticker", value="MELI", max_chars=10)
       .strip()
       .upper()
   )
@@ -75,154 +74,216 @@ def calculate_fcf_from_raw(df):
 
 @st.cache_data(ttl=86400)
 def fetch_and_parse_ticker(ticker):
-  company = Company(ticker)
-  filings = company.get_filings(form="10-Q")
-  if len(filings) < 4:
-    filings = company.get_filings()[:40]
-  else:
-    filings = filings[:40]
-
-  def parse_multi_val(df, keywords, min_val=None):
-    if df is None:
-      return np.nan
-    for kw in keywords:
-      match = df[df["label"].str.contains(kw, case=False, na=False)]
-      if not match.empty:
-        num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
-        if num_cols:
-          val_raw = match.iloc[0][num_cols[0]]
-          if pd.notna(val_raw):
-            val_str = (
-                str(val_raw)
-                .replace("$", "")
-                .replace(",", "")
-                .replace("(", "-")
-                .replace(")", "")
-            )
-            try:
-              val = float(val_str)
-              if min_val is not None and val < min_val:
-                continue
-              return val
-            except:
-              pass
-    return np.nan
-
-  def get_exact_val(df, label_name):
-    if df is None:
-      return np.nan
-    m = df[df["label"] == label_name]
-    if m.empty:
-      m = df[df["label"].str.contains(label_name, case=False, na=False)]
-    if m.empty:
-      return np.nan
-    num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
-    if not num_cols:
-      return np.nan
-    val_raw = m.iloc[0][num_cols[0]]
-    if pd.isna(val_raw):
-      return np.nan
-    val_str = (
-        str(val_raw)
-        .replace("$", "")
-        .replace(",", "")
-        .replace("(", "-")
-        .replace(")", "")
-    )
-    try:
-      return float(val_str)
-    except:
-      return np.nan
-
   records = []
-  for f in filings:
-    try:
-      obj = f.obj()
-      inc = obj.income_statement
-      cf = obj.cash_flow_statement
-      if inc is None:
-        continue
-      inc_df = inc.to_dataframe(view="standard")
-      cf_df = cf.to_dataframe(view="standard") if cf is not None else None
+  edgar_success = False
 
-      rev = parse_multi_val(
-          inc_df, [
-              "Revenue",
-              "Total revenue",
-              "Revenues, net",
-              "Net revenues",
-              "Total net revenues",
-          ]
-      )
-      op_inc = parse_multi_val(
-          inc_df,
-          [
-              "Income from operations",
-              "Loss from operations",
-              "Income (loss) from operations",
-              "Operating income (loss)",
-              "Profit from operations",
-              "Operating profit",
-          ],
-      )
-      net_inc = parse_multi_val(
-          inc_df,
-          [
-              "Net income including",
-              "Net income (loss)",
-              "Net loss",
-              "Net income",
-              "Profit (loss) for the period",
-          ],
-      )
-      eps_diluted = parse_multi_val(
-          inc_df,
-          [
-              "Diluted earnings per share",
-              "Earnings per share, diluted",
-              "Diluted (in USD per share)",
-              "Basic and diluted",
-              "Diluted",
-              "Earnings per share - diluted",
-              "Diluted earnings (loss) per share",
-          ],
-      )
-      diluted_shares = parse_multi_val(
-          inc_df,
-          [
-              "Weighted-average shares outstanding, diluted",
-              "Weighted average shares outstanding, diluted",
-              "Weighted average number of shares outstanding, diluted",
-              "Weighted average shares diluted",
-              "Diluted shares",
-              "Number of diluted shares",
-          ],
-          min_val=100000,
-      )
+  # Try SEC EDGAR first
+  try:
+    company = Company(ticker)
+    filings = company.get_filings(form="10-Q")
+    if len(filings) < 4:
+      filings = company.get_filings()[:40]
+    else:
+      filings = filings[:40]
 
-      ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
-      capex = get_exact_val(cf_df, "Purchases of property and equipment")
-      if pd.isna(capex) and cf_df is not None:
-        capex = parse_multi_val(
-            cf_df, [
-                "Additions to property",
-                "Purchases of property",
-                "Capital expenditures",
+    def parse_multi_val(df, keywords, min_val=None):
+      if df is None:
+        return np.nan
+      for kw in keywords:
+        match = df[df["label"].str.contains(kw, case=False, na=False)]
+        if not match.empty:
+          num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
+          if num_cols:
+            val_raw = match.iloc[0][num_cols[0]]
+            if pd.notna(val_raw):
+              val_str = (
+                  str(val_raw)
+                  .replace("$", "")
+                  .replace(",", "")
+                  .replace("(", "-")
+                  .replace(")", "")
+              )
+              try:
+                val = float(val_str)
+                if min_val is not None and val < min_val:
+                  continue
+                return val
+              except:
+                pass
+      return np.nan
+
+    def get_exact_val(df, label_name):
+      if df is None:
+        return np.nan
+      m = df[df["label"] == label_name]
+      if m.empty:
+        m = df[df["label"].str.contains(label_name, case=False, na=False)]
+      if m.empty:
+        return np.nan
+      num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
+      if not num_cols:
+        return np.nan
+      val_raw = m.iloc[0][num_cols[0]]
+      if pd.isna(val_raw):
+        return np.nan
+      val_str = (
+          str(val_raw)
+          .replace("$", "")
+          .replace(",", "")
+          .replace("(", "-")
+          .replace(")", "")
+      )
+      try:
+        return float(val_str)
+      except:
+        return np.nan
+
+    for f in filings:
+      try:
+        obj = f.obj()
+        inc = obj.income_statement
+        cf = obj.cash_flow_statement
+        if inc is None:
+          continue
+        inc_df = inc.to_dataframe(view="standard")
+        cf_df = cf.to_dataframe(view="standard") if cf is not None else None
+
+        rev = parse_multi_val(
+            inc_df, [
+                "Revenue",
+                "Total revenue",
+                "Revenues, net",
+                "Net revenues",
+                "Total net revenues",
             ]
         )
+        op_inc = parse_multi_val(
+            inc_df,
+            [
+                "Income from operations",
+                "Loss from operations",
+                "Income (loss) from operations",
+                "Operating income (loss)",
+                "Profit from operations",
+                "Operating profit",
+            ],
+        )
+        net_inc = parse_multi_val(
+            inc_df,
+            [
+                "Net income including",
+                "Net income (loss)",
+                "Net loss",
+                "Net income",
+                "Profit (loss) for the period",
+            ],
+        )
+        eps_diluted = parse_multi_val(
+            inc_df,
+            [
+                "Diluted earnings per share",
+                "Earnings per share, diluted",
+                "Diluted (in USD per share)",
+                "Basic and diluted",
+                "Diluted",
+                "Earnings per share - diluted",
+                "Diluted earnings (loss) per share",
+            ],
+        )
+        diluted_shares = parse_multi_val(
+            inc_df,
+            [
+                "Weighted-average shares outstanding, diluted",
+                "Weighted average shares outstanding, diluted",
+                "Weighted average number of shares outstanding, diluted",
+                "Weighted average shares diluted",
+                "Diluted shares",
+                "Number of diluted shares",
+            ],
+            min_val=100000,
+        )
 
-      records.append({
-          "Period": str(f.period_of_report),
-          "Revenue": rev,
-          "Operating_Income": op_inc,
-          "Net_Income": net_inc,
-          "Diluted_EPS": eps_diluted,
-          "Diluted_Shares": diluted_shares,
-          "OCF": ocf,
-          "Capex": capex,
-      })
-    except Exception:
-      continue
+        ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
+        capex = get_exact_val(cf_df, "Purchases of property and equipment")
+        if pd.isna(capex) and cf_df is not None:
+          capex = parse_multi_val(
+              cf_df, [
+                  "Additions to property",
+                  "Purchases of property",
+                  "Capital expenditures",
+              ]
+          )
+
+        records.append({
+            "Period": str(f.period_of_report),
+            "Revenue": rev,
+            "Operating_Income": op_inc,
+            "Net_Income": net_inc,
+            "Diluted_EPS": eps_diluted,
+            "Diluted_Shares": diluted_shares,
+            "OCF": ocf,
+            "Capex": capex,
+        })
+      except Exception:
+        continue
+    if len(records) >= 4:
+      edgar_success = True
+  except Exception:
+    edgar_success = False
+
+  # If EDGAR returned nothing or insufficient data (e.g. Foreign / IFRS / 20-F filer), pull via yfinance quarterly statements
+  if not edgar_success or len(records) < 4:
+    records = []
+    tk = yf.Ticker(ticker)
+    q_inc = tk.quarterly_income_stmt
+    q_cf = tk.quarterly_cashflow
+    q_bal = tk.quarterly_balance_sheet
+    if q_inc is not None and not q_inc.empty:
+      dates = q_inc.columns
+      for date_col in dates:
+        period_str = str(date_col)[:10]
+
+        def get_yf_row(df_q, possible_names):
+          if df_q is None or df_q.empty:
+            return np.nan
+          for name in possible_names:
+            if name in df_q.index:
+              v = df_q.loc[name, date_col]
+              if pd.notna(v):
+                return float(v)
+          return np.nan
+
+        rev = get_yf_row(
+            q_inc, ["Total Revenue", "Total Revenues", "Operating Revenue", "Revenue"]
+        )
+        op_inc = get_yf_row(
+            q_inc, ["Operating Income", "EBIT", "Operating Profit"]
+        )
+        net_inc = get_yf_row(
+            q_inc, ["Net Income", "Net Income Common Stockholders"]
+        )
+        eps_dil = get_yf_row(q_inc, ["Diluted EPS", "Basic EPS"])
+
+        ocf = get_yf_row(
+            q_cf, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"]
+        )
+        capex = get_yf_row(
+            q_cf, ["Capital Expenditure", "Purchase Of Property And Equipment"]
+        )
+        shares = get_yf_row(
+            q_bal, ["Ordinary Shares Number", "Share Issued", "Common Stock"]
+        )
+
+        records.append({
+            "Period": period_str,
+            "Revenue": rev,
+            "Operating_Income": op_inc,
+            "Net_Income": net_inc,
+            "Diluted_EPS": eps_dil,
+            "Diluted_Shares": shares,
+            "OCF": ocf,
+            "Capex": capex,
+        })
 
   df = (
       pd.DataFrame(records)
@@ -230,48 +291,8 @@ def fetch_and_parse_ticker(ticker):
       .drop_duplicates(subset=["Period"])
       .reset_index(drop=True)
   )
-  df["Q_Key"] = pd.to_datetime(df["Period"]).dt.to_period("Q")
 
-  # --- Fallback: Pull from yfinance quarterly income/balance sheet if SEC XBRL missed EPS/Shares ---
-  try:
-    tk = yf.Ticker(ticker)
-    q_inc = tk.quarterly_income_stmt
-    q_bal = tk.quarterly_balance_sheet
-    if q_inc is not None and not q_inc.empty:
-      q_inc.columns = pd.to_datetime(q_inc.columns).to_period("Q")
-      for idx, row in df.iterrows():
-        qk = row["Q_Key"]
-        if qk in q_inc.columns:
-          if pd.isna(row["Diluted_EPS"]):
-            for eps_key in [
-                "Diluted EPS",
-                "Basic EPS",
-                "Diluted Earnings Per Share",
-            ]:
-              if eps_key in q_inc.index:
-                val = q_inc.loc[eps_key, qk]
-                if pd.notna(val):
-                  df.loc[idx, "Diluted_EPS"] = float(val)
-                  break
-        if q_bal is not None and not q_bal.empty:
-          q_bal.columns = pd.to_datetime(q_bal.columns).to_period("Q")
-          if qk in q_bal.columns:
-            if pd.isna(row["Diluted_Shares"]):
-              for share_key in [
-                  "Ordinary Shares Number",
-                  "Share Issued",
-                  "Common Stock",
-                  "Diluted Average Shares",
-              ]:
-                if share_key in q_bal.index:
-                  val = q_bal.loc[share_key, qk]
-                  if pd.notna(val):
-                    df.loc[idx, "Diluted_Shares"] = float(val)
-                    break
-  except Exception:
-    pass
-
-  # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
+  # Fill missing shares from Net Income / EPS if needed
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
   df["Diluted_Shares"] = df["Diluted_Shares"].fillna(implied_shares)
 
@@ -316,47 +337,16 @@ def fetch_market_and_shares(ticker):
       current_price = hist["Close"].iloc[-1]
   if not market_cap and current_price and info.get("sharesOutstanding"):
     market_cap = current_price * info.get("sharesOutstanding")
-
-  shares_df = None
-  try:
-    q_balance = tk.quarterly_balance_sheet
-    if q_balance is not None and not q_balance.empty:
-      q_balance.columns = pd.to_datetime(q_balance.columns).to_period("Q")
-      for idx_name in [
-          "Ordinary Shares Number",
-          "Share Issued",
-          "Common Stock",
-          "Diluted Average Shares",
-      ]:
-        if idx_name in q_balance.index:
-          shares_series = q_balance.loc[idx_name] / 1e6
-          shares_df = pd.DataFrame({
-              "Q_Key": shares_series.index,
-              "YF_Shares_M": shares_series.values,
-          })
-          break
-  except Exception:
-    pass
-
-  return hist, current_price, market_cap, shares_df
+  return hist, current_price, market_cap
 
 
 try:
   with st.spinner(
-      f"Extracting SEC XBRL filings & market data for {ticker_symbol}..."
+      f"Extracting financial statements & market data for {ticker_symbol}..."
   ):
     df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
-    hist_price, current_price, market_cap, yf_shares_df = (
-        fetch_market_and_shares(ticker_symbol)
-    )
-
-  if yf_shares_df is not None and not yf_shares_df.empty:
-    df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Q_Key", how="left")
-    df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(
-        df_raw_full["YF_Shares_M"]
-    )
-    df_raw_full["Share_Dilution_YoY_%"] = (
-        df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
+    hist_price, current_price, market_cap = fetch_market_and_shares(
+        ticker_symbol
     )
 
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
@@ -388,8 +378,7 @@ try:
 
   fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
   fig.suptitle(
-      f"{ticker_symbol} Comprehensive Financial & Growth Dashboard (Direct SEC"
-      " XBRL)",
+      f"{ticker_symbol} Comprehensive Financial & Growth Dashboard",
       fontsize=15,
       fontweight="bold",
       y=0.98,
