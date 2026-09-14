@@ -26,21 +26,22 @@ with st.sidebar:
       .upper()
   )
   lookback_quarters = st.slider(
-      "Historical Lookback (Quarters)", min_value=12, max_value=40, value=24, step=4
+      "Historical Lookback (Quarters)", min_value=12, max_value=40, value=20, step=4
   )
   run_button = st.button("Generate Report", type="primary")
 
   st.markdown("---")
   st.caption(
       "**Audit Advisory:** Always cross-reference extracted XBRL line items"
-      " against official SEC 10-Q/10-K PDF filings for institutional accuracy."
+      " official SEC 10-Q/10-K PDF filings for institutional accuracy."
   )
 
 
 @st.cache_data(ttl=86400)
-def fetch_and_parse_ticker(ticker, num_quarters):
+def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
-  filings_10q = company.get_filings(form="10-Q")[:num_quarters]
+  # Always fetch max history (40 quarters) once and cache the raw dataset
+  filings_10q = company.get_filings(form="10-Q")[:40]
 
   def parse_multi_val(df, keywords):
     if df is None:
@@ -185,9 +186,11 @@ def fetch_and_parse_ticker(ticker, num_quarters):
 
 try:
   with st.spinner(f"Extracting SEC XBRL filings for {ticker_symbol}..."):
-    df_raw, df_fcf = fetch_and_parse_ticker(
-        ticker_symbol, lookback_quarters
-    )
+    df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
+
+  # Local slice based on the slider
+  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
+  df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
