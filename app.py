@@ -77,7 +77,7 @@ def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
   filings_10q = company.get_filings(form="10-Q")[:40]
 
-  def parse_multi_val(df, keywords):
+  def parse_multi_val(df, keywords, min_val=None):
     if df is None:
       return np.nan
     for kw in keywords:
@@ -95,7 +95,10 @@ def fetch_and_parse_ticker(ticker):
                 .replace(")", "")
             )
             try:
-              return float(val_str)
+              val = float(val_str)
+              if min_val is not None and val < min_val:
+                continue
+              return val
             except:
               pass
     return np.nan
@@ -163,6 +166,17 @@ def fetch_and_parse_ticker(ticker):
             "Diluted",
         ],
     )
+    diluted_shares = parse_multi_val(
+        inc_df,
+        [
+            "Weighted-average shares outstanding, diluted",
+            "Weighted average shares outstanding, diluted",
+            "Weighted average number of shares outstanding, diluted",
+            "Weighted average shares diluted",
+            "Diluted shares",
+        ],
+        min_val=100000,
+    )
 
     ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
     capex = get_exact_val(cf_df, "Purchases of property and equipment")
@@ -173,6 +187,7 @@ def fetch_and_parse_ticker(ticker):
         "Operating_Income": op_inc,
         "Net_Income": net_inc,
         "Diluted_EPS": eps_diluted,
+        "Diluted_Shares": diluted_shares,
         "OCF": ocf,
         "Capex": capex,
     })
@@ -184,24 +199,18 @@ def fetch_and_parse_ticker(ticker):
   df["Rev_YoY_%"] = df["Revenue_B"].pct_change(periods=4, fill_method=None) * 100
   df["Rev_QoQ_%"] = df["Revenue_B"].pct_change(periods=1, fill_method=None) * 100
 
-  # Clip extreme percentage growth outliers caused by near-zero denominators
-  df["EPS_YoY_%"] = (
-      df["Diluted_EPS"]
-      .pct_change(periods=4, fill_method=None)
-      .clip(lower=-300, upper=300)
-      * 100
-  )
-  df["EPS_QoQ_%"] = (
-      df["Diluted_EPS"]
-      .pct_change(periods=1, fill_method=None)
-      .clip(lower=-300, upper=300)
-      * 100
-  )
+  # Clean EPS growth: mask out absurd denominator blowups when EPS is near zero
+  eps_yoy_raw = df["Diluted_EPS"].pct_change(periods=4, fill_method=None) * 100
+  eps_qoq_raw = df["Diluted_EPS"].pct_change(periods=1, fill_method=None) * 100
+  df["EPS_YoY_%"] = eps_yoy_raw.where(df["Diluted_EPS"].shift(4).abs() > 0.05, np.nan).clip(-150, 150)
+  df["EPS_QoQ_%"] = eps_qoq_raw.where(df["Diluted_EPS"].shift(1).abs() > 0.05, np.nan).clip(-150, 150)
 
   df["Op_Margin_%"] = (df["Operating_Income"] / df["Revenue"]) * 100
   df["Net_Margin_%"] = (df["Net_Income"] / df["Revenue"]) * 100
 
   df["Capex_B"] = np.abs(df["Capex"]) / 1e9
+  df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
+  df["Share_Dilution_YoY_%"] = df["Diluted_Shares_M"].pct_change(periods=4, fill_method=None) * 100
 
   df_fcf = calculate_fcf_from_raw(df)
   return df, df_fcf
@@ -226,7 +235,6 @@ def fetch_market_and_shares(ticker):
   if not market_cap and current_price and info.get("sharesOutstanding"):
     market_cap = current_price * info.get("sharesOutstanding")
 
-  # Get historical quarterly share counts from yfinance if available
   shares_df = None
   try:
     q_balance = tk.quarterly_balance_sheet
@@ -234,7 +242,7 @@ def fetch_market_and_shares(ticker):
       if "Ordinary Shares Number" in q_balance.index:
         shares_series = q_balance.loc["Ordinary Shares Number"] / 1e6
         shares_df = pd.DataFrame(
-            {"Period": shares_series.index.astype(str), "Diluted_Shares_M": shares_series.values}
+            {"Period": shares_series.index.astype(str), "YF_Shares_M": shares_series.values}
         ).sort_values("Period")
   except Exception:
     pass
@@ -249,17 +257,16 @@ try:
         ticker_symbol
     )
 
-  # Merge share count if available from yfinance
   if yf_shares_df is not None and not yf_shares_df.empty:
     df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Period", how="left")
-  else:
-    df_raw_full["Diluted_Shares_M"] = np.nan
+    df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(df_raw_full["YF_Shares_M"])
+    df_raw_full["Share_Dilution_YoY_%"] = df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
 
   # Local slice based on slider
-  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
+  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=Target_Index if 'Target_Index' in locals() else True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
-  # Calculate TTM & Annualized Quarter Valuation metrics with outlier protection
+  # Calculate TTM & Annualized Quarter Valuation metrics with P/E cleaning
   if market_cap:
     df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
     df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
@@ -268,9 +275,12 @@ try:
 
     df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
     df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
-    # Clip P/E values between -100 and +150 to prevent near-zero EPS blowups
-    df_raw["P_E_TTM"] = (current_price / df_raw["TTM_EPS"]).clip(lower=-100, upper=150)
-    df_raw["P_E_Ann"] = (current_price / df_raw["Ann_EPS"]).clip(lower=-100, upper=150)
+    
+    # Only calculate P/E when earnings are positive to avoid wild negative/infinite spikes
+    pe_ttm_raw = current_price / df_raw["TTM_EPS"]
+    pe_ann_raw = current_price / df_raw["Ann_EPS"]
+    df_raw["P_E_TTM"] = pe_ttm_raw.where(df_raw["TTM_EPS"] > 0, np.nan).clip(0, 100)
+    df_raw["P_E_Ann"] = pe_ann_raw.where(df_raw["Ann_EPS"] > 0, np.nan).clip(0, 100)
 
     merged_fcf = df_raw[["Period"]].merge(
         df_fcf[["Period", "FCF"]], on="Period", how="left"
@@ -440,11 +450,11 @@ try:
   st.pyplot(fig)
 
   st.markdown("---")
-  st.subheader(f"{ticker_symbol} — Valuation Multiples, Shares & Price Action")
+  st.subheader(f"{ticker_symbol} — Valuation Multiples & Price Action")
 
   fig2, axes2 = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
   fig2.suptitle(
-      f"{ticker_symbol} Price Action, TTM/Annualized Multiples & Capital Structure",
+      f"{ticker_symbol} Price Action, TTM/Annualized Multiples & FCF Yield",
       fontsize=15,
       fontweight="bold",
       y=0.98,
@@ -509,7 +519,7 @@ try:
   ax_p2.legend(loc="upper left", fontsize=7)
   ax_p2.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter - Bounded)
+  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter - Profitable Only)
   ax_p3 = axes2[1, 0]
   ax_p3.plot(
       df_raw["Period"],
@@ -559,6 +569,48 @@ try:
 
   plt.tight_layout(rect=[0, 0, 1, 0.98])
   st.pyplot(fig2)
+
+  # Bottom Section: Capital Structure & Dilution Rate vs Capex
+  st.markdown("---")
+  st.subheader(f"{ticker_symbol} — Capital Expenditures & Share Dilution Rate")
+
+  fig3, axes3 = plt.subplots(1, 2, figsize=(16, 5), dpi=150)
+
+  # Panel A: Capex ($B)
+  ax_c1 = axes3[0]
+  ax_c1.bar(
+      df_raw["Period"],
+      df_raw["Capex_B"],
+      color="#F59E0B",
+      alpha=0.85,
+      width=0.55,
+      label="Capex ($B)",
+  )
+  ax_c1.set_title("Quarterly Capital Expenditures ($B)", fontweight="bold", fontsize=10.5)
+  ax_c1.set_ylabel("Capex ($ Billions)", color="#B45309")
+  ax_c1.tick_params(axis="x", rotation=45, labelsize=7)
+  ax_c1.legend(loc="upper left", fontsize=7)
+  ax_c1.grid(True, linestyle="--", alpha=0.3)
+
+  # Panel B: Share Dilution Rate YoY (%)
+  ax_c2 = axes3[1]
+  ax_c2.plot(
+      df_raw["Period"],
+      df_raw["Share_Dilution_YoY_%"],
+      color="#2563EB",
+      marker="o",
+      linewidth=2,
+      label="Diluted Share Growth YoY (%)",
+  )
+  ax_c2.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+  ax_c2.set_title("Share Dilution / Buyback Rate (YoY % Change)", fontweight="bold", fontsize=10.5)
+  ax_c2.set_ylabel("Share Count YoY Change (%)", color="#1D4ED8")
+  ax_c2.tick_params(axis="x", rotation=45, labelsize=7)
+  ax_c2.legend(loc="upper left", fontsize=7)
+  ax_c2.grid(True, linestyle="--", alpha=0.3)
+
+  plt.tight_layout()
+  st.pyplot(fig3)
 
   with st.expander("View Raw Extracted Dataset & Valuations"):
     st.dataframe(df_raw, use_container_width=True)
