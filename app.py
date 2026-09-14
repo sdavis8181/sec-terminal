@@ -1,8 +1,10 @@
+from pathlib import Path
 from edgar import Company, set_identity
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 set_identity("Scott Scott@example.com")
 
@@ -37,10 +39,43 @@ with st.sidebar:
   )
 
 
+def calculate_fcf_from_raw(df):
+  df_cf_raw = df[["Period", "OCF", "Capex"]].dropna(subset=["OCF"]).copy()
+  df_cf_raw["Capex"] = df_cf_raw["Capex"].fillna(0)
+  df_cf_raw["Month"] = pd.to_datetime(df_cf_raw["Period"]).dt.month
+  standalone_ocf, standalone_capex = [], []
+  prev_year, prev_ocf_ytd, prev_capex_ytd = None, 0, 0
+  for idx, row in df_cf_raw.iterrows():
+    m = row["Month"]
+    curr_year = pd.to_datetime(row["Period"]).year
+    ocf_ytd, capex_ytd = row["OCF"], row["Capex"]
+    if curr_year != prev_year or m == 3:
+      q_ocf, q_capex = ocf_ytd, capex_ytd
+    else:
+      q_ocf, q_capex = ocf_ytd - prev_ocf_ytd, capex_ytd - prev_capex_ytd
+    standalone_ocf.append(q_ocf)
+    standalone_capex.append(q_capex)
+    prev_year = curr_year
+    prev_ocf_ytd, prev_capex_ytd = ocf_ytd, capex_ytd
+
+  df_fcf = pd.DataFrame({
+      "Period": df_cf_raw["Period"],
+      "FCF": np.array(standalone_ocf) - np.abs(np.array(standalone_capex)),
+  })
+  df_fcf["FCF_B"] = df_fcf["FCF"] / 1e9
+  df_fcf["FCF_YoY_%"] = df_fcf["FCF"].pct_change(
+      periods=4, fill_method=None
+  ) * 100
+  df_fcf["FCF_QoQ_%"] = df_fcf["FCF"].pct_change(
+      periods=1, fill_method=None
+  ) * 100
+  return df_fcf
+
+
 @st.cache_data(ttl=86400)
-def fetch_and_parse_ticker(ticker, num_quarters):
+def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
-  filings_10q = company.get_filings(form="10-Q")[:num_quarters]
+  filings_10q = company.get_filings(form="10-Q")[:40]
 
   def parse_multi_val(df, keywords):
     if df is None:
@@ -159,43 +194,52 @@ def fetch_and_parse_ticker(ticker, num_quarters):
   df["Op_Margin_%"] = (df["Operating_Income"] / df["Revenue"]) * 100
   df["Net_Margin_%"] = (df["Net_Income"] / df["Revenue"]) * 100
 
-  # YTD to Standalone Cash Flow disaggregation
-  df_cf_raw = df[["Period", "OCF", "Capex"]].dropna(subset=["OCF"]).copy()
-  df_cf_raw["Capex"] = df_cf_raw["Capex"].fillna(0)
-  df_cf_raw["Month"] = pd.to_datetime(df_cf_raw["Period"]).dt.month
-  standalone_ocf, standalone_capex = [], []
-  prev_year, prev_ocf_ytd, prev_capex_ytd = None, 0, 0
-  for idx, row in df_cf_raw.iterrows():
-    m = row["Month"]
-    curr_year = pd.to_datetime(row["Period"]).year
-    ocf_ytd, capex_ytd = row["OCF"], row["Capex"]
-    if curr_year != prev_year or m == 3:
-      q_ocf, q_capex = ocf_ytd, capex_ytd
-    else:
-      q_ocf, q_capex = ocf_ytd - prev_ocf_ytd, capex_ytd - prev_capex_ytd
-    standalone_ocf.append(q_ocf)
-    standalone_capex.append(q_capex)
-    prev_year = curr_year
-    prev_ocf_ytd, prev_capex_ytd = ocf_ytd, capex_ytd
-
-  df_fcf = pd.DataFrame({
-      "Period": df_cf_raw["Period"],
-      "FCF": np.array(standalone_ocf) - np.abs(np.array(standalone_capex)),
-  })
-  df_fcf["FCF_B"] = df_fcf["FCF"] / 1e9
-  df_fcf["FCF_YoY_%"] = df_fcf["FCF"].pct_change(
-      periods=4, fill_method=None
-  ) * 100
-  df_fcf["FCF_QoQ_%"] = df_fcf["FCF"].pct_change(
-      periods=1, fill_method=None
-  ) * 100
-
+  df_fcf = calculate_fcf_from_raw(df)
   return df, df_fcf
 
 
+@st.cache_data(ttl=3600)
+def fetch_market_data(ticker):
+  tk = yf.Ticker(ticker)
+  info = tk.info
+  market_cap = info.get("marketCap")
+  current_price = (
+      info.get("currentPrice")
+      or info.get("regularMarketPrice")
+      or info.get("previousClose")
+  )
+  hist = tk.history(period="2y")
+  if not hist.empty:
+    hist["EMA50"] = hist["Close"].ewm(span=50, adjust=False).mean()
+    hist["EMA200"] = hist["Close"].ewm(span=200, adjust=False).mean()
+    if not current_price:
+      current_price = hist["Close"].iloc[-1]
+  if not market_cap and current_price and info.get("sharesOutstanding"):
+    market_cap = current_price * info.get("sharesOutstanding")
+  return hist, current_price, market_cap
+
+
 try:
-  with st.spinner(f"Extracting SEC XBRL filings for {ticker_symbol}..."):
-    df_raw, df_fcf = fetch_and_parse_ticker(ticker_symbol, lookback_quarters)
+  with st.spinner(f"Extracting SEC XBRL filings & market data for {ticker_symbol}..."):
+    df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
+    hist_price, current_price, market_cap = fetch_market_data(ticker_symbol)
+
+  # Local slice based on slider
+  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
+  df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
+
+  # Calculate TTM & Valuation metrics per quarter
+  if market_cap:
+    df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
+    df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
+    df_raw["P_S_Ratio"] = market_cap / df_raw["TTM_Revenue"]
+    df_raw["P_E_Ratio"] = current_price / df_raw["TTM_EPS"]
+    # Merge FCF into df_raw for FCF Yield
+    merged_fcf = df_raw[["Period"]].merge(
+        df_fcf[["Period", "FCF"]], on="Period", how="left"
+    )
+    df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
+    df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
@@ -286,10 +330,11 @@ try:
 
   # 3. FCF
   ax3 = axes[1, 0]
-  v_fcf = df_fcf.dropna(subset=["FCF_B"])
+  v_fcf = df_fcf.tail(lookback_quarters).reset_index(drop=True)
+  v_fcf_clean = v_fcf.dropna(subset=["FCF_B"])
   ax3.bar(
-      v_fcf["Period"],
-      v_fcf["FCF_B"],
+      v_fcf_clean["Period"],
+      v_fcf_clean["FCF_B"],
       color="#10B981",
       alpha=0.85,
       width=0.55,
@@ -304,16 +349,16 @@ try:
   ax3.tick_params(axis="x", rotation=45, labelsize=7)
   ax3_sub = ax3.twinx()
   ax3_sub.plot(
-      v_fcf["Period"],
-      v_fcf["FCF_YoY_%"],
+      v_fcf_clean["Period"],
+      v_fcf_clean["FCF_YoY_%"],
       color="#EF4444",
       marker="o",
       linewidth=1.5,
       label="YoY Growth (%)",
   )
   ax3_sub.plot(
-      v_fcf["Period"],
-      v_fcf["FCF_QoQ_%"],
+      v_fcf_clean["Period"],
+      v_fcf_clean["FCF_QoQ_%"],
       color="#3B82F6",
       marker="s",
       linestyle="--",
@@ -354,10 +399,106 @@ try:
   ax4.legend(loc="upper left", fontsize=7)
   ax4.grid(True, linestyle="--", alpha=0.3)
 
-  plt.tight_layout(rect=[0, 0, 1, 0.95])
+  plt.tight_layout(rect=[0, 0, 1, 0.98])
   st.pyplot(fig)
 
-  with st.expander("View Raw Extracted Dataset"):
+  st.markdown("---")
+  st.subheader(f"{ticker_symbol} — Valuation & Price Action Dashboard")
+
+  fig2, axes2 = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
+  fig2.suptitle(
+      f"{ticker_symbol} Valuation Multiples & Price Action (50/200 EMA)",
+      fontsize=15,
+      fontweight="bold",
+      y=0.98,
+  )
+
+  # Valuation Chart 1: Stock Price + 50/200 EMA
+  ax_p1 = axes2[0, 0]
+  if not hist_price.empty:
+    ax_p1.plot(
+        hist_price.index,
+        hist_price["Close"],
+        color="#1F2937",
+        linewidth=1.5,
+        label="Close Price ($)",
+    )
+    ax_p1.plot(
+        hist_price.index,
+        hist_price["EMA50"],
+        color="#3B82F6",
+        linestyle="-",
+        linewidth=1.2,
+        label="50-Day EMA",
+    )
+    ax_p1.plot(
+        hist_price.index,
+        hist_price["EMA200"],
+        color="#EF4444",
+        linestyle="--",
+        linewidth=1.2,
+        label="200-Day EMA",
+    )
+  ax_p1.set_title("Daily Stock Price vs 50/200 EMA", fontweight="bold", fontsize=10.5)
+  ax_p1.set_ylabel("Price ($)", color="#1F2937")
+  ax_p1.tick_params(axis="x", rotation=45, labelsize=7)
+  ax_p1.legend(loc="upper left", fontsize=7)
+  ax_p1.grid(True, linestyle="--", alpha=0.3)
+
+  # Valuation Chart 2: P/S Ratio over Quarters
+  ax_p2 = axes2[0, 1]
+  ax_p2.plot(
+      df_raw["Period"],
+      df_raw["P_S_Ratio"],
+      color="#8B5CF6",
+      marker="o",
+      linewidth=2,
+      label="P/S (TTM)",
+  )
+  ax_p2.set_title("Price-to-Sales (P/S) Ratio", fontweight="bold", fontsize=10.5)
+  ax_p2.set_ylabel("P/S Multiple (x)", color="#6D28D9")
+  ax_p2.tick_params(axis="x", rotation=45, labelsize=7)
+  ax_p2.legend(loc="upper left", fontsize=7)
+  ax_p2.grid(True, linestyle="--", alpha=0.3)
+
+  # Valuation Chart 3: P/E Ratio over Quarters
+  ax_p3 = axes2[1, 0]
+  ax_p3.plot(
+      df_raw["Period"],
+      df_raw["P_E_Ratio"],
+      color="#10B981",
+      marker="s",
+      linewidth=2,
+      label="P/E (TTM)",
+  )
+  ax_p3.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+  ax_p3.set_title("Price-to-Earnings (P/E) Ratio", fontweight="bold", fontsize=10.5)
+  ax_p3.set_ylabel("P/E Multiple (x)", color="#047857")
+  ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
+  axp3_legend = ax_p3.legend(loc="upper left", fontsize=7)
+  ax_p3.grid(True, linestyle="--", alpha=0.3)
+
+  # Valuation Chart 4: FCF Yield Line Graph
+  ax_p4 = axes2[1, 1]
+  ax_p4.plot(
+      df_raw["Period"],
+      df_raw["FCF_Yield_%"],
+      color="#F59E0B",
+      marker="^",
+      linewidth=2,
+      label="FCF Yield (%)",
+  )
+  ax_p4.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+  ax_p4.set_title("Free Cash Flow Yield (%)", fontweight="bold", fontsize=10.5)
+  ax_p4.set_ylabel("FCF Yield (%)", color="#B45309")
+  ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
+  ax_p4.legend(loc="upper left", fontsize=7)
+  ax_p4.grid(True, linestyle="--", alpha=0.3)
+
+  plt.tight_layout(rect=[0, 0, 1, 0.98])
+  st.pyplot(fig2)
+
+  with st.expander("View Raw Extracted Dataset & Valuations"):
     st.dataframe(df_raw, use_container_width=True)
 
 except Exception as e:
