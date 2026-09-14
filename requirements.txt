@@ -3,3 +3,4 @@ edgartools
 pandas
 matplotlib
 numpy
+yfinance
