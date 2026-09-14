@@ -20,6 +20,12 @@ st.markdown(
 
 with st.sidebar:
   st.header("Terminal Controls")
+
+  # Option to upload a previously saved CSV to bypass SEC scraping
+  uploaded_file = st.file_uploader(
+      "Load Saved Ticker (CSV)", type=["csv"], help="Upload a previously exported ticker CSV for instant loading."
+  )
+
   ticker_symbol = (
       st.text_input("Stock Ticker", value="UBER", max_chars=10)
       .strip()
@@ -33,14 +39,13 @@ with st.sidebar:
   st.markdown("---")
   st.caption(
       "**Audit Advisory:** Always cross-reference extracted XBRL line items"
-      " official SEC 10-Q/10-K PDF filings for institutional accuracy."
+      " against official SEC 10-Q/10-K PDF filings for institutional accuracy."
   )
 
 
 @st.cache_data(ttl=86400)
 def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
-  # Always fetch max history (40 quarters) once and cache the raw dataset
   filings_10q = company.get_filings(form="10-Q")[:40]
 
   def parse_multi_val(df, keywords):
@@ -184,15 +189,62 @@ def fetch_and_parse_ticker(ticker):
   return df, df_fcf
 
 
+def calculate_fcf_from_raw(df):
+  df_cf_raw = df[["Period", "OCF", "Capex"]].dropna(subset=["OCF"]).copy()
+  df_cf_raw["Capex"] = df_cf_raw["Capex"].fillna(0)
+  df_cf_raw["Month"] = pd.to_datetime(df_cf_raw["Period"]).dt.month
+  standalone_ocf, standalone_capex = [], []
+  prev_year, prev_ocf_ytd, prev_capex_ytd = None, 0, 0
+  for idx, row in df_cf_raw.iterrows():
+    m = row["Month"]
+    curr_year = pd.to_datetime(row["Period"]).year
+    ocf_ytd, capex_ytd = row["OCF"], row["Capex"]
+    if curr_year != prev_year or m == 3:
+      q_ocf, q_capex = ocf_ytd, capex_ytd
+    else:
+      q_ocf, q_capex = ocf_ytd - prev_ocf_ytd, capex_ytd - prev_capex_ytd
+    standalone_ocf.append(q_ocf)
+    standalone_capex.append(q_capex)
+    prev_year = curr_year
+    prev_ocf_ytd, prev_capex_ytd = ocf_ytd, capex_ytd
+
+  df_fcf = pd.DataFrame({
+      "Period": df_cf_raw["Period"],
+      "FCF": np.array(standalone_ocf) - np.abs(np.array(standalone_capex)),
+  })
+  df_fcf["FCF_B"] = df_fcf["FCF"] / 1e9
+  df_fcf["FCF_YoY_%"] = df_fcf["FCF"].pct_change(
+      periods=4, fill_method=None
+  ) * 100
+  df_fcf["FCF_QoQ_%"] = df_fcf["FCF"].pct_change(
+      periods=1, fill_method=None
+  ) * 100
+  return df_fcf
+
+
 try:
-  with st.spinner(f"Extracting SEC XBRL filings for {ticker_symbol}..."):
-    df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
+  if uploaded_file is not None:
+    df_raw_full = pd.read_csv(uploaded_file)
+    df_fcf_full = calculate_fcf_from_raw(df_raw_full)
+    st.info("Loaded dataset from uploaded CSV file.")
+  else:
+    with st.spinner(f"Extracting SEC XBRL filings for {ticker_symbol}..."):
+      df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
 
   # Local slice based on the slider
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
+
+  # Download button for current dataset
+  csv_data = df_raw_full.to_csv(index=False).encode("utf-8")
+  st.download_button(
+      label=f"💾 Download {ticker_symbol} Data (CSV)",
+      data=csv_data,
+      file_name=f"{ticker_symbol}_sec_data.csv",
+      mime="text/csv",
+  )
 
   fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
   fig.suptitle(
