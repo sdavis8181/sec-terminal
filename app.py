@@ -23,7 +23,7 @@ st.markdown(
 with st.sidebar:
   st.header("Terminal Controls")
   ticker_symbol = (
-      st.text_input("Stock Ticker", value="UBER", max_chars=10)
+      st.text_input("Stock Ticker", value="TMDX", max_chars=10)
       .strip()
       .upper()
   )
@@ -40,7 +40,8 @@ with st.sidebar:
 
 
 def calculate_fcf_from_raw(df):
-  df_cf_raw = df[["Period", "OCF", "Capex"]].dropna(subset=["OCF"]).copy()
+  df_cf_raw = df[["Period", "OCF", "Capex"]].copy()
+  df_cf_raw["OCF"] = df_cf_raw["OCF"].fillna(0)
   df_cf_raw["Capex"] = df_cf_raw["Capex"].fillna(0)
   df_cf_raw["Month"] = pd.to_datetime(df_cf_raw["Period"]).dt.month
   standalone_ocf, standalone_capex = [], []
@@ -77,7 +78,6 @@ def fetch_and_parse_ticker(ticker):
   records = []
   edgar_success = False
 
-  # Try U.S. SEC EDGAR 10-Q path first
   try:
     company = Company(ticker)
     filings = company.get_filings(form="10-Q")
@@ -111,32 +111,6 @@ def fetch_and_parse_ticker(ticker):
               except:
                 pass
       return np.nan
-
-    def get_exact_val(df, label_name):
-      if df is None:
-        return np.nan
-      m = df[df["label"] == label_name]
-      if m.empty:
-        m = df[df["label"].str.contains(label_name, case=False, na=False)]
-      if m.empty:
-        return np.nan
-      num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
-      if not num_cols:
-        return np.nan
-      val_raw = m.iloc[0][num_cols[0]]
-      if pd.isna(val_raw):
-        return np.nan
-      val_str = (
-          str(val_raw)
-          .replace("$", "")
-          .replace(",", "")
-          .replace("(", "-")
-          .replace(")", "")
-      )
-      try:
-        return float(val_str)
-      except:
-        return np.nan
 
     for f in filings:
       try:
@@ -203,16 +177,20 @@ def fetch_and_parse_ticker(ticker):
             min_val=100000,
         )
 
-        ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
-        capex = get_exact_val(cf_df, "Purchases of property and equipment")
-        if pd.isna(capex) and cf_df is not None:
-          capex = parse_multi_val(
-              cf_df, [
-                  "Additions to property",
-                  "Purchases of property",
-                  "Capital expenditures",
-              ]
-          )
+        ocf = parse_multi_val(
+            cf_df, [
+                "Net cash provided by operating activities",
+                "Net cash provided by (used in) operating activities",
+                "Operating cash flow",
+            ]
+        )
+        capex = parse_multi_val(
+            cf_df, [
+                "Purchases of property and equipment",
+                "Additions to property and equipment",
+                "Capital expenditures",
+            ]
+        )
 
         records.append({
             "Period": str(f.period_of_report)[:10],
@@ -231,7 +209,7 @@ def fetch_and_parse_ticker(ticker):
   except Exception:
     edgar_success = False
 
-  # If EDGAR returned nothing (Foreign / IFRS / 20-F filer like MELI or NU), pull via yfinance quarterly statements
+  # Fallback to yfinance if EDGAR didn't return enough records
   if not edgar_success or len(records) < 4:
     records = []
     tk = yf.Ticker(ticker)
@@ -270,7 +248,6 @@ def fetch_and_parse_ticker(ticker):
                 "Diluted EPS",
                 "Basic EPS",
                 "Diluted Earnings Per Share",
-                "Basic EPS",
             ]
         )
         shares = get_val(
@@ -281,14 +258,6 @@ def fetch_and_parse_ticker(ticker):
                 "Diluted Average Shares",
             ]
         )
-        if pd.isna(shares):
-          shares = get_val(
-              q_inc, [
-                  "Diluted Average Shares",
-                  "Basic Average Shares",
-                  "Average Diluted Shares Outstanding",
-              ]
-          )
         ocf = get_val(
             q_cf, [
                 "Operating Cash Flow",
@@ -317,13 +286,11 @@ def fetch_and_parse_ticker(ticker):
       .reset_index(drop=True)
   )
 
-  # Ensure Diluted_EPS and Diluted_Shares are time-series arrays
   if "Diluted_EPS" in df.columns:
     df["Diluted_EPS"] = pd.to_numeric(df["Diluted_EPS"], errors="coerce")
   if "Diluted_Shares" in df.columns:
     df["Diluted_Shares"] = pd.to_numeric(df["Diluted_Shares"], errors="coerce")
 
-  # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
   df["Diluted_Shares"] = df["Diluted_Shares"].fillna(implied_shares)
 
