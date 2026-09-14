@@ -220,35 +220,37 @@ def fetch_and_parse_ticker(ticker):
       continue
 
   df = pd.DataFrame(records).sort_values("Period").drop_duplicates(subset=["Period"]).reset_index(drop=True)
+  df["Q_Key"] = pd.to_datetime(df["Period"]).dt.to_period("Q")
 
-  # Fallback augmentation via yfinance for IFRS / Foreign filers where SEC XBRL labels differ
+  # Reliable yfinance quarterly fallback mapped by fiscal quarter (Q_Key)
   try:
     tk = yf.Ticker(ticker)
     q_inc = tk.quarterly_income_stmt
     q_bal = tk.quarterly_balance_sheet
     if q_inc is not None and not q_inc.empty:
-      for col_date in df["Period"]:
-        idx = df[df["Period"] == col_date].index[0]
-        # Match nearest yfinance quarter column
-        for yf_col in q_inc.columns:
-          if str(yf_col)[:7] == col_date[:7]:
-            if pd.isna(df.loc[idx, "Diluted_EPS"]):
-              for eps_key in ["Diluted EPS", "Basic EPS"]:
-                if eps_key in q_inc.index:
-                  val = q_inc.loc[eps_key, yf_col]
-                  if pd.notna(val):
-                    df.loc[idx, "Diluted_EPS"] = float(val)
-                    break
-        if q_bal is not None and not q_bal.empty:
-          for yf_col in q_bal.columns:
-            if str(yf_col)[:7] == col_date[:7]:
-              if pd.isna(df.loc[idx, "Diluted_Shares"]):
-                for share_key in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
-                  if share_key in q_bal.index:
-                    val = q_bal.loc[share_key, yf_col]
-                    if pd.notna(val):
-                      df.loc[idx, "Diluted_Shares"] = float(val)
-                      break
+      q_inc.columns = pd.to_datetime(q_inc.columns).to_period("Q")
+      for idx, row in df.iterrows():
+        qk = row["Q_Key"]
+        if qk in q_inc.columns:
+          if pd.isna(row["Diluted_EPS"]):
+            for eps_key in ["Diluted EPS", "Basic EPS"]:
+              if eps_key in q_inc.index:
+                val = q_inc.loc[eps_key, qk]
+                if pd.notna(val):
+                  df.loc[idx, "Diluted_EPS"] = float(val)
+                  break
+    if q_bal is not None and not q_bal.empty:
+      q_bal.columns = pd.to_datetime(q_bal.columns).to_period("Q")
+      for idx, row in df.iterrows():
+        qk = row["Q_Key"]
+        if qk in q_bal.columns:
+          if pd.isna(row["Diluted_Shares"]):
+            for share_key in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+              if share_key in q_bal.index:
+                val = q_bal.loc[share_key, qk]
+                if pd.notna(val):
+                  df.loc[idx, "Diluted_Shares"] = float(val)
+                  break
   except Exception:
     pass
 
@@ -296,12 +298,13 @@ def fetch_market_and_shares(ticker):
   try:
     q_balance = tk.quarterly_balance_sheet
     if q_balance is not None and not q_balance.empty:
+      q_balance.columns = pd.to_datetime(q_balance.columns).to_period("Q")
       for idx_name in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
         if idx_name in q_balance.index:
           shares_series = q_balance.loc[idx_name] / 1e6
           shares_df = pd.DataFrame(
-              {"Period": shares_series.index.astype(str), "YF_Shares_M": shares_series.values}
-          ).sort_values("Period")
+              {"Q_Key": shares_series.index, "YF_Shares_M": shares_series.values}
+          )
           break
   except Exception:
     pass
@@ -317,7 +320,7 @@ try:
     )
 
   if yf_shares_df is not None and not yf_shares_df.empty:
-    df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Period", how="left")
+    df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Q_Key", how="left")
     df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(df_raw_full["YF_Shares_M"])
     df_raw_full["Share_Dilution_YoY_%"] = df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
 
