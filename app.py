@@ -16,8 +16,9 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Dashboard")
 st.markdown(
-    "Enter a stock ticker to pull live GAAP financial statements, disaggregate"
-    " standalone quarterly cash flows, and generate executive growth charts."
+    "Enter a stock ticker to pull live GAAP/IFRS financial statements,"
+    " disaggregate standalone quarterly cash flows, and generate executive"
+    " growth charts."
 )
 
 with st.sidebar:
@@ -203,7 +204,11 @@ def fetch_and_parse_ticker(ticker):
       capex = get_exact_val(cf_df, "Purchases of property and equipment")
       if pd.isna(capex) and cf_df is not None:
         capex = parse_multi_val(
-            cf_df, ["Additions to property", "Purchases of property", "Capital expenditures"]
+            cf_df, [
+                "Additions to property",
+                "Purchases of property",
+                "Capital expenditures",
+            ]
         )
 
       records.append({
@@ -219,10 +224,15 @@ def fetch_and_parse_ticker(ticker):
     except Exception:
       continue
 
-  df = pd.DataFrame(records).sort_values("Period").drop_duplicates(subset=["Period"]).reset_index(drop=True)
+  df = (
+      pd.DataFrame(records)
+      .sort_values("Period")
+      .drop_duplicates(subset=["Period"])
+      .reset_index(drop=True)
+  )
   df["Q_Key"] = pd.to_datetime(df["Period"]).dt.to_period("Q")
 
-  # Fallback augmentation via yfinance for IFRS / Foreign filers
+  # --- Fallback: Pull from yfinance quarterly income/balance sheet if SEC XBRL missed EPS/Shares ---
   try:
     tk = yf.Ticker(ticker)
     q_inc = tk.quarterly_income_stmt
@@ -233,7 +243,11 @@ def fetch_and_parse_ticker(ticker):
         qk = row["Q_Key"]
         if qk in q_inc.columns:
           if pd.isna(row["Diluted_EPS"]):
-            for eps_key in ["Diluted EPS", "Basic EPS"]:
+            for eps_key in [
+                "Diluted EPS",
+                "Basic EPS",
+                "Diluted Earnings Per Share",
+            ]:
               if eps_key in q_inc.index:
                 val = q_inc.loc[eps_key, qk]
                 if pd.notna(val):
@@ -243,7 +257,12 @@ def fetch_and_parse_ticker(ticker):
           q_bal.columns = pd.to_datetime(q_bal.columns).to_period("Q")
           if qk in q_bal.columns:
             if pd.isna(row["Diluted_Shares"]):
-              for share_key in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+              for share_key in [
+                  "Ordinary Shares Number",
+                  "Share Issued",
+                  "Common Stock",
+                  "Diluted Average Shares",
+              ]:
                 if share_key in q_bal.index:
                   val = q_bal.loc[share_key, qk]
                   if pd.notna(val):
@@ -252,7 +271,7 @@ def fetch_and_parse_ticker(ticker):
   except Exception:
     pass
 
-  # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS
+  # Universal fallback: Derive implied diluted shares from Net Income / Diluted EPS if still NaN
   implied_shares = df["Net_Income"] / df["Diluted_EPS"]
   df["Diluted_Shares"] = df["Diluted_Shares"].fillna(implied_shares)
 
@@ -271,7 +290,9 @@ def fetch_and_parse_ticker(ticker):
 
   df["Capex_B"] = np.abs(df["Capex"]) / 1e9
   df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
-  df["Share_Dilution_YoY_%"] = df["Diluted_Shares_M"].pct_change(periods=4, fill_method=None) * 100
+  df["Share_Dilution_YoY_%"] = (
+      df["Diluted_Shares_M"].pct_change(periods=4, fill_method=None) * 100
+  )
 
   df_fcf = calculate_fcf_from_raw(df)
   return df, df_fcf
@@ -301,12 +322,18 @@ def fetch_market_and_shares(ticker):
     q_balance = tk.quarterly_balance_sheet
     if q_balance is not None and not q_balance.empty:
       q_balance.columns = pd.to_datetime(q_balance.columns).to_period("Q")
-      for idx_name in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+      for idx_name in [
+          "Ordinary Shares Number",
+          "Share Issued",
+          "Common Stock",
+          "Diluted Average Shares",
+      ]:
         if idx_name in q_balance.index:
           shares_series = q_balance.loc[idx_name] / 1e6
-          shares_df = pd.DataFrame(
-              {"Q_Key": shares_series.index, "YF_Shares_M": shares_series.values}
-          )
+          shares_df = pd.DataFrame({
+              "Q_Key": shares_series.index,
+              "YF_Shares_M": shares_series.values,
+          })
           break
   except Exception:
     pass
@@ -315,16 +342,22 @@ def fetch_market_and_shares(ticker):
 
 
 try:
-  with st.spinner(f"Extracting SEC XBRL filings & market data for {ticker_symbol}..."):
+  with st.spinner(
+      f"Extracting SEC XBRL filings & market data for {ticker_symbol}..."
+  ):
     df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
-    hist_price, current_price, market_cap, yf_shares_df = fetch_market_and_shares(
-        ticker_symbol
+    hist_price, current_price, market_cap, yf_shares_df = (
+        fetch_market_and_shares(ticker_symbol)
     )
 
   if yf_shares_df is not None and not yf_shares_df.empty:
     df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Q_Key", how="left")
-    df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(df_raw_full["YF_Shares_M"])
-    df_raw_full["Share_Dilution_YoY_%"] = df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
+    df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(
+        df_raw_full["YF_Shares_M"]
+    )
+    df_raw_full["Share_Dilution_YoY_%"] = (
+        df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
+    )
 
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
@@ -332,13 +365,16 @@ try:
   if market_cap:
     df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
     df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
-    df_raw["P_S_TTM"] = (market_cap / df_raw["TTM_Revenue"]).clip(lower=0, upper=150)
-    df_raw["P_S_Ann"] = (market_cap / df_raw["Ann_Revenue"]).clip(lower=0, upper=150)
+    df_raw["P_S_TTM"] = (market_cap / df_raw["TTM_Revenue"]).clip(
+        lower=0, upper=150
+    )
+    df_raw["P_S_Ann"] = (market_cap / df_raw["Ann_Revenue"]).clip(
+        lower=0, upper=150
+    )
 
     df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
     df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
-    
-    # Plot annualized Q and TTM P/E across all positive/reasonable earnings rows
+
     df_raw["P_E_TTM"] = (current_price / df_raw["TTM_EPS"]).clip(-150, 200)
     df_raw["P_E_Ann"] = (current_price / df_raw["Ann_EPS"]).clip(-150, 200)
 
