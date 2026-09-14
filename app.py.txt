@@ -1,0 +1,359 @@
+from edgar import Company, set_identity
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+set_identity("Scott Scott@example.com")
+
+st.set_page_config(
+    page_title="SEC XBRL Financial Terminal",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.title("Institutional SEC XBRL Financial Dashboard")
+st.markdown(
+    "Enter a stock ticker to pull live GAAP financial statements, disaggregate"
+    " standalone quarterly cash flows, and generate executive growth charts."
+)
+
+with st.sidebar:
+  st.header("Terminal Controls")
+  ticker_symbol = (
+      st.text_input("Stock Ticker", value="UBER", max_chars=10)
+      .strip()
+      .upper()
+  )
+  lookback_quarters = st.slider(
+      "Historical Lookback (Quarters)", min_value=12, max_value=40, value=24, step=4
+  )
+  run_button = st.button("Generate Report", type="primary")
+
+  st.markdown("---")
+  st.caption(
+      "**Audit Advisory:** Always cross-reference extracted XBRL line items"
+      " against official SEC 10-Q/10-K PDF filings for institutional accuracy."
+  )
+
+
+@st.cache_data(ttl=86400)
+def fetch_and_parse_ticker(ticker, num_quarters):
+  company = Company(ticker)
+  filings_10q = company.get_filings(form="10-Q")[:num_quarters]
+
+  def parse_multi_val(df, keywords):
+    if df is None:
+      return np.nan
+    for kw in keywords:
+      match = df[df["label"].str.contains(kw, case=False, na=False)]
+      if not match.empty:
+        num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
+        if num_cols:
+          val_raw = match.iloc[0][num_cols[0]]
+          if pd.notna(val_raw):
+            val_str = (
+                str(val_raw)
+                .replace("$", "")
+                .replace(",", "")
+                .replace("(", "-")
+                .replace(")", "")
+            )
+            try:
+              return float(val_str)
+            except:
+              pass
+    return np.nan
+
+  def get_exact_val(df, label_name):
+    if df is None:
+      return np.nan
+    m = df[df["label"] == label_name]
+    if m.empty:
+      m = df[df["label"].str.contains(label_name, case=False, na=False)]
+    if m.empty:
+      return np.nan
+    num_cols = [c for c in df.columns if "202" in str(c) or "201" in str(c)]
+    if not num_cols:
+      return np.nan
+    val_raw = m.iloc[0][num_cols[0]]
+    if pd.isna(val_raw):
+      return np.nan
+    val_str = (
+        str(val_raw)
+        .replace("$", "")
+        .replace(",", "")
+        .replace("(", "-")
+        .replace(")", "")
+    )
+    try:
+      return float(val_str)
+    except:
+      return np.nan
+
+  records = []
+  for f in filings_10q:
+    obj = f.obj()
+    inc = obj.income_statement
+    cf = obj.cash_flow_statement
+    if inc is None:
+      continue
+    inc_df = inc.to_dataframe(view="standard")
+    cf_df = cf.to_dataframe(view="standard") if cf is not None else None
+
+    rev = parse_multi_val(
+        inc_df, ["Revenue", "Total revenue", "Revenues, net"]
+    )
+    op_inc = parse_multi_val(
+        inc_df,
+        [
+            "Income from operations",
+            "Loss from operations",
+            "Income (loss) from operations",
+            "Operating income (loss)",
+        ],
+    )
+    net_inc = parse_multi_val(
+        inc_df,
+        ["Net income including", "Net income (loss)", "Net loss", "Net income"],
+    )
+    eps_diluted = parse_multi_val(inc_df, ["Diluted"])
+
+    ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
+    capex = get_exact_val(cf_df, "Purchases of property and equipment")
+
+    records.append({
+        "Period": str(f.period_of_report),
+        "Revenue": rev,
+        "Operating_Income": op_inc,
+        "Net_Income": net_inc,
+        "Diluted_EPS": eps_diluted,
+        "OCF": ocf,
+        "Capex": capex,
+    })
+
+  df = pd.DataFrame(records).sort_values("Period").reset_index(drop=True)
+
+  # Derived metrics
+  df["Revenue_B"] = df["Revenue"] / 1e9
+  df["Rev_YoY_%"] = df["Revenue_B"].pct_change(periods=4, fill_method=None) * 100
+  df["Rev_QoQ_%"] = df["Revenue_B"].pct_change(periods=1, fill_method=None) * 100
+
+  df["EPS_YoY_%"] = df["Diluted_EPS"].pct_change(
+      periods=4, fill_method=None
+  ) * 100
+  df["EPS_QoQ_%"] = df["Diluted_EPS"].pct_change(
+      periods=1, fill_method=None
+  ) * 100
+
+  df["Op_Margin_%"] = (df["Operating_Income"] / df["Revenue"]) * 100
+  df["Net_Margin_%"] = (df["Net_Income"] / df["Revenue"]) * 100
+
+  # YTD to Standalone Cash Flow disaggregation
+  df_cf_raw = df[["Period", "OCF", "Capex"]].dropna(subset=["OCF"]).copy()
+  df_cf_raw["Capex"] = df_cf_raw["Capex"].fillna(0)
+  df_cf_raw["Month"] = pd.to_datetime(df_cf_raw["Period"]).dt.month
+  standalone_ocf, standalone_capex = [], []
+  prev_year, prev_ocf_ytd, prev_capex_ytd = None, 0, 0
+  for idx, row in df_cf_raw.iterrows():
+    m = row["Month"]
+    curr_year = pd.to_datetime(row["Period"]).year
+    ocf_ytd, capex_ytd = row["OCF"], row["Capex"]
+    if curr_year != prev_year or m == 3:
+      q_ocf, q_capex = ocf_ytd, capex_ytd
+    else:
+      q_ocf, q_capex = ocf_ytd - prev_ocf_ytd, capex_ytd - prev_capex_ytd
+    standalone_ocf.append(q_ocf)
+    standalone_capex.append(q_capex)
+    prev_year = curr_year
+    prev_ocf_ytd, prev_capex_ytd = ocf_ytd, capex_ytd
+
+  df_fcf = pd.DataFrame({
+      "Period": df_cf_raw["Period"],
+      "FCF": np.array(standalone_ocf) - np.abs(np.array(standalone_capex)),
+  })
+  df_fcf["FCF_B"] = df_fcf["FCF"] / 1e9
+  df_fcf["FCF_YoY_%"] = df_fcf["FCF"].pct_change(
+      periods=4, fill_method=None
+  ) * 100
+  df_fcf["FCF_QoQ_%"] = df_fcf["FCF"].pct_change(
+      periods=1, fill_method=None
+  ) * 100
+
+  return df, df_fcf
+
+
+try:
+  with st.spinner(f"Extracting SEC XBRL filings for {ticker_symbol}..."):
+    df_raw, df_fcf = fetch_and_parse_ticker(
+        ticker_symbol, lookback_quarters
+    )
+
+  st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
+
+  fig, axes = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
+  fig.suptitle(
+      f"{ticker_symbol} Comprehensive Financial & Growth Dashboard (Direct SEC"
+      " XBRL)",
+      fontsize=15,
+      fontweight="bold",
+      y=0.98,
+  )
+
+  # 1. Revenue
+  ax1 = axes[0, 0]
+  v_rev = df_raw.dropna(subset=["Revenue_B"])
+  ax1.bar(
+      v_rev["Period"],
+      v_rev["Revenue_B"],
+      color="#8B5CF6",
+      alpha=0.85,
+      width=0.55,
+      label="Revenue ($B)",
+  )
+  ax1.set_title("Revenue ($B) & YoY/QoQ Growth", fontweight="bold", fontsize=10.5)
+  ax1.set_ylabel("Revenue ($ Billions)", color="#6D28D9")
+  ax1.tick_params(axis="x", rotation=45, labelsize=7)
+  ax1_sub = ax1.twinx()
+  ax1_sub.plot(
+      v_rev["Period"],
+      v_rev["Rev_YoY_%"],
+      color="#EF4444",
+      marker="o",
+      linewidth=1.5,
+      label="YoY Growth (%)",
+  )
+  ax1_sub.plot(
+      v_rev["Period"],
+      v_rev["Rev_QoQ_%"],
+      color="#10B981",
+      marker="s",
+      linestyle="--",
+      linewidth=1.2,
+      label="QoQ Growth (%)",
+  )
+  ax1_sub.set_ylabel("Growth (%)", fontsize=8)
+  ax1_sub.grid(False)
+  l1, lb1 = ax1.get_legend_handles_labels()
+  l1s, lb1s = ax1_sub.get_legend_handles_labels()
+  ax1.legend(l1 + l1s, lb1 + lb1s, loc="upper left", fontsize=6.5)
+
+  # 2. EPS
+  ax2 = axes[0, 1]
+  v_eps = df_raw.dropna(subset=["Diluted_EPS"])
+  ax2.bar(
+      v_eps["Period"],
+      v_eps["Diluted_EPS"],
+      color="#3B82F6",
+      alpha=0.85,
+      width=0.55,
+      label="Diluted EPS ($)",
+  )
+  ax2.set_title("Diluted EPS ($) & Growth", fontweight="bold", fontsize=10.5)
+  ax2.set_ylabel("EPS ($)", color="#1D4ED8")
+  ax2.tick_params(axis="x", rotation=45, labelsize=7)
+  ax2_sub = ax2.twinx()
+  ax2_sub.plot(
+      v_eps["Period"],
+      v_eps["EPS_YoY_%"],
+      color="#EF4444",
+      marker="o",
+      linewidth=1.5,
+      label="YoY Growth (%)",
+  )
+  ax2_sub.plot(
+      v_eps["Period"],
+      v_eps["EPS_QoQ_%"],
+      color="#10B981",
+      marker="s",
+      linestyle="--",
+      linewidth=1.2,
+      label="QoQ Growth (%)",
+  )
+  ax2_sub.set_ylabel("Growth (%)", fontsize=8)
+  ax2_sub.grid(False)
+  l2, lb2 = ax2.get_legend_handles_labels()
+  l2s, lb2s = ax2_sub.get_legend_handles_labels()
+  ax2.legend(l2 + l2s, lb2 + lb2s, loc="upper left", fontsize=6.5)
+
+  # 3. FCF
+  ax3 = axes[1, 0]
+  v_fcf = df_fcf.dropna(subset=["FCF_B"])
+  ax3.bar(
+      v_fcf["Period"],
+      v_fcf["FCF_B"],
+      color="#10B981",
+      alpha=0.85,
+      width=0.55,
+      label="Free Cash Flow ($B)",
+  )
+  ax3.set_title(
+      "Standalone Free Cash Flow ($B) & Growth",
+      fontweight="bold",
+      fontsize=10.5,
+  )
+  ax3.set_ylabel("FCF ($ Billions)", color="#047857")
+  ax3.tick_params(axis="x", rotation=45, labelsize=7)
+  ax3_sub = ax3.twinx()
+  ax3_sub.plot(
+      v_fcf["Period"],
+      v_fcf["FCF_YoY_%"],
+      color="#EF4444",
+      marker="o",
+      linewidth=1.5,
+      label="YoY Growth (%)",
+  )
+  ax3_sub.plot(
+      v_fcf["Period"],
+      v_fcf["FCF_QoQ_%"],
+      color="#3B82F6",
+      marker="s",
+      linestyle="--",
+      linewidth=1.2,
+      label="QoQ Growth (%)",
+  )
+  ax3_sub.set_ylabel("Growth (%)", fontsize=8)
+  ax3_sub.grid(False)
+  l3, lb3 = ax3.get_legend_handles_labels()
+  l3s, lb3s = ax3_sub.get_legend_handles_labels()
+  ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6.5)
+
+  # 4. Margins (Line Chart)
+  ax4 = axes[1, 1]
+  ax4.plot(
+      df_raw["Period"],
+      df_raw["Op_Margin_%"],
+      color="#3B82F6",
+      marker="o",
+      linewidth=2,
+      label="Operating Margin (%)",
+  )
+  ax4.plot(
+      df_raw["Period"],
+      df_raw["Net_Margin_%"],
+      color="#8B5CF6",
+      marker="s",
+      linestyle="--",
+      linewidth=2,
+      label="Net Margin (%)",
+  )
+  ax4.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+  ax4.set_title(
+      "Operating Margin vs. Net Margin (%)", fontweight="bold", fontsize=10.5
+  )
+  ax4.set_ylabel("Margin (%)", color="#1F2937")
+  ax4.tick_params(axis="x", rotation=45, labelsize=7)
+  ax4.legend(loc="upper left", fontsize=7)
+  ax4.grid(True, linestyle="--", alpha=0.3)
+
+  plt.tight_layout(rect=[0, 0, 1, 0.95])
+  st.pyplot(fig)
+
+  with st.expander("View Raw Extracted Dataset"):
+    st.dataframe(df_raw, use_container_width=True)
+
+except Exception as e:
+  st.error(
+      f"Could not load data for ticker '{ticker_symbol}'. Check ticker symbol or"
+      f" network connection. Error: {e}"
+  )
