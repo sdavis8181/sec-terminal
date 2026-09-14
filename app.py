@@ -35,7 +35,7 @@ with st.sidebar:
   st.markdown("---")
   st.caption(
       "**Audit Advisory:** Always cross-reference extracted XBRL line items"
-      " against official SEC 10-Q/10-K PDF filings for institutional accuracy."
+      " against official SEC 10-Q/10-K/20-F PDF filings for institutional accuracy."
   )
 
 
@@ -75,7 +75,12 @@ def calculate_fcf_from_raw(df):
 @st.cache_data(ttl=86400)
 def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
-  filings_10q = company.get_filings(form="10-Q")[:40]
+  # Try 10-Q first; fall back or include other primary quarterly/annual views if available
+  filings = company.get_filings(form="10-Q")
+  if len(filings) < 4:
+    filings = company.get_filings()[:40]
+  else:
+    filings = filings[:40]
 
   def parse_multi_val(df, keywords, min_val=None):
     if df is None:
@@ -130,76 +135,97 @@ def fetch_and_parse_ticker(ticker):
       return np.nan
 
   records = []
-  for f in filings_10q:
-    obj = f.obj()
-    inc = obj.income_statement
-    cf = obj.cash_flow_statement
-    if inc is None:
+  for f in filings:
+    try:
+      obj = f.obj()
+      inc = obj.income_statement
+      cf = obj.cash_flow_statement
+      if inc is None:
+        continue
+      inc_df = inc.to_dataframe(view="standard")
+      cf_df = cf.to_dataframe(view="standard") if cf is not None else None
+
+      rev = parse_multi_val(
+          inc_df, [
+              "Revenue",
+              "Total revenue",
+              "Revenues, net",
+              "Net revenues",
+              "Total net revenues",
+          ]
+      )
+      op_inc = parse_multi_val(
+          inc_df,
+          [
+              "Income from operations",
+              "Loss from operations",
+              "Income (loss) from operations",
+              "Operating income (loss)",
+              "Profit from operations",
+              "Operating profit",
+          ],
+      )
+      net_inc = parse_multi_val(
+          inc_df,
+          [
+              "Net income including",
+              "Net income (loss)",
+              "Net loss",
+              "Net income",
+              "Profit (loss) for the period",
+          ],
+      )
+      eps_diluted = parse_multi_val(
+          inc_df,
+          [
+              "Diluted earnings per share",
+              "Earnings per share, diluted",
+              "Diluted (in USD per share)",
+              "Basic and diluted",
+              "Diluted",
+              "Earnings per share - diluted",
+          ],
+      )
+      diluted_shares = parse_multi_val(
+          inc_df,
+          [
+              "Weighted-average shares outstanding, diluted",
+              "Weighted average shares outstanding, diluted",
+              "Weighted average number of shares outstanding, diluted",
+              "Weighted average shares diluted",
+              "Diluted shares",
+              "Number of diluted shares",
+          ],
+          min_val=100000,
+      )
+
+      ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
+      capex = get_exact_val(cf_df, "Purchases of property and equipment")
+      if pd.isna(capex) and cf_df is not None:
+        capex = parse_multi_val(
+            cf_df, ["Additions to property", "Purchases of property", "Capital expenditures"]
+        )
+
+      records.append({
+          "Period": str(f.period_of_report),
+          "Revenue": rev,
+          "Operating_Income": op_inc,
+          "Net_Income": net_inc,
+          "Diluted_EPS": eps_diluted,
+          "Diluted_Shares": diluted_shares,
+          "OCF": ocf,
+          "Capex": capex,
+      })
+    except Exception:
       continue
-    inc_df = inc.to_dataframe(view="standard")
-    cf_df = cf.to_dataframe(view="standard") if cf is not None else None
 
-    rev = parse_multi_val(
-        inc_df, ["Revenue", "Total revenue", "Revenues, net", "Net revenues"]
-    )
-    op_inc = parse_multi_val(
-        inc_df,
-        [
-            "Income from operations",
-            "Loss from operations",
-            "Income (loss) from operations",
-            "Operating income (loss)",
-            "Profit from operations",
-        ],
-    )
-    net_inc = parse_multi_val(
-        inc_df,
-        ["Net income including", "Net income (loss)", "Net loss", "Net income"],
-    )
-    eps_diluted = parse_multi_val(
-        inc_df,
-        [
-            "Diluted earnings per share",
-            "Earnings per share, diluted",
-            "Diluted (in USD per share)",
-            "Basic and diluted",
-            "Diluted",
-        ],
-    )
-    diluted_shares = parse_multi_val(
-        inc_df,
-        [
-            "Weighted-average shares outstanding, diluted",
-            "Weighted average shares outstanding, diluted",
-            "Weighted average number of shares outstanding, diluted",
-            "Weighted average shares diluted",
-            "Diluted shares",
-        ],
-        min_val=100000,
-    )
-
-    ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
-    capex = get_exact_val(cf_df, "Purchases of property and equipment")
-
-    records.append({
-        "Period": str(f.period_of_report),
-        "Revenue": rev,
-        "Operating_Income": op_inc,
-        "Net_Income": net_inc,
-        "Diluted_EPS": eps_diluted,
-        "Diluted_Shares": diluted_shares,
-        "OCF": ocf,
-        "Capex": capex,
-    })
-
-  df = pd.DataFrame(records).sort_values("Period").reset_index(drop=True)
+  df = pd.DataFrame(records).sort_values("Period").drop_duplicates(subset=["Period"]).reset_index(drop=True)
 
   # Derived metrics
   df["Revenue_B"] = df["Revenue"] / 1e9
   df["Rev_YoY_%"] = df["Revenue_B"].pct_change(periods=4, fill_method=None) * 100
   df["Rev_QoQ_%"] = df["Revenue_B"].pct_change(periods=1, fill_method=None) * 100
 
-  # Clean EPS growth: mask out absurd denominator blowups when EPS is near zero
   eps_yoy_raw = df["Diluted_EPS"].pct_change(periods=4, fill_method=None) * 100
   eps_qoq_raw = df["Diluted_EPS"].pct_change(periods=1, fill_method=None) * 100
   df["EPS_YoY_%"] = eps_yoy_raw.where(df["Diluted_EPS"].shift(4).abs() > 0.05, np.nan).clip(-150, 150)
@@ -239,11 +265,13 @@ def fetch_market_and_shares(ticker):
   try:
     q_balance = tk.quarterly_balance_sheet
     if q_balance is not None and not q_balance.empty:
-      if "Ordinary Shares Number" in q_balance.index:
-        shares_series = q_balance.loc["Ordinary Shares Number"] / 1e6
-        shares_df = pd.DataFrame(
-            {"Period": shares_series.index.astype(str), "YF_Shares_M": shares_series.values}
-        ).sort_values("Period")
+      for idx_name in ["Ordinary Shares Number", "Share Issued", "Common Stock"]:
+        if idx_name in q_balance.index:
+          shares_series = q_balance.loc[idx_name] / 1e6
+          shares_df = pd.DataFrame(
+              {"Period": shares_series.index.astype(str), "YF_Shares_M": shares_series.values}
+          ).sort_values("Period")
+          break
   except Exception:
     pass
 
@@ -262,11 +290,10 @@ try:
     df_raw_full["Diluted_Shares_M"] = df_raw_full["Diluted_Shares_M"].fillna(df_raw_full["YF_Shares_M"])
     df_raw_full["Share_Dilution_YoY_%"] = df_raw_full["Diluted_Shares_M"].pct_change(periods=4) * 100
 
-  # Local slice based on slider
-  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=Target_Index if 'Target_Index' in locals() else True)
+  # Clean slice
+  df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
-  # Calculate TTM & Annualized Quarter Valuation metrics with P/E cleaning
   if market_cap:
     df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
     df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
@@ -276,7 +303,6 @@ try:
     df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
     df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
     
-    # Only calculate P/E when earnings are positive to avoid wild negative/infinite spikes
     pe_ttm_raw = current_price / df_raw["TTM_EPS"]
     pe_ann_raw = current_price / df_raw["Ann_EPS"]
     df_raw["P_E_TTM"] = pe_ttm_raw.where(df_raw["TTM_EPS"] > 0, np.nan).clip(0, 100)
@@ -375,7 +401,7 @@ try:
   l2s, lb2s = ax2_sub.get_legend_handles_labels()
   ax2.legend(l2 + l2s, lb2 + lb2s, loc="upper left", fontsize=6.5)
 
-  # 3. FCF (Standalone FCF & Growth)
+  # 3. FCF
   ax3 = axes[1, 0]
   v_fcf = df_fcf.tail(lookback_quarters).reset_index(drop=True)
   v_fcf_clean = v_fcf.dropna(subset=["FCF_B"])
@@ -418,7 +444,7 @@ try:
   l3s, lb3s = ax3_sub.get_legend_handles_labels()
   ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6.5)
 
-  # 4. Margins (Line Chart)
+  # 4. Margins
   ax4 = axes[1, 1]
   ax4.plot(
       df_raw["Period"],
@@ -492,7 +518,7 @@ try:
   ax_p1.legend(loc="upper left", fontsize=7)
   ax_p1.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 2: P/S Ratio (TTM vs Annualized Quarter)
+  # Valuation Chart 2: P/S Ratio
   ax_p2 = axes2[0, 1]
   ax_p2.plot(
       df_raw["Period"],
@@ -519,7 +545,7 @@ try:
   ax_p2.legend(loc="upper left", fontsize=7)
   ax_p2.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter - Profitable Only)
+  # Valuation Chart 3: P/E Ratio
   ax_p3 = axes2[1, 0]
   ax_p3.plot(
       df_raw["Period"],
