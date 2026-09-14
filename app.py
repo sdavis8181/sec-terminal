@@ -163,6 +163,15 @@ def fetch_and_parse_ticker(ticker):
             "Basic and diluted",
         ],
     )
+    diluted_shares = parse_multi_val(
+        inc_df,
+        [
+            "Weighted average shares diluted",
+            "Diluted shares",
+            "Weighted average number of shares outstanding, diluted",
+            "Weighted average shares outstanding, diluted",
+        ],
+    )
 
     ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
     capex = get_exact_val(cf_df, "Purchases of property and equipment")
@@ -173,6 +182,7 @@ def fetch_and_parse_ticker(ticker):
         "Operating_Income": op_inc,
         "Net_Income": net_inc,
         "Diluted_EPS": eps_diluted,
+        "Diluted_Shares": diluted_shares,
         "OCF": ocf,
         "Capex": capex,
     })
@@ -228,18 +238,31 @@ try:
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
-  # Calculate TTM & Valuation metrics per quarter
+  # Calculate TTM & Annualized Quarter Valuation metrics
   if market_cap:
     df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
+    df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
+    df_raw["P_S_TTM"] = market_cap / df_raw["TTM_Revenue"]
+    df_raw["P_S_Ann"] = market_cap / df_raw["Ann_Revenue"]
+
     df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
-    df_raw["P_S_Ratio"] = market_cap / df_raw["TTM_Revenue"]
-    df_raw["P_E_Ratio"] = current_price / df_raw["TTM_EPS"]
-    # Merge FCF into df_raw for FCF Yield
+    df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
+    df_raw["P_E_TTM"] = current_price / df_raw["TTM_EPS"]
+    df_raw["P_E_Ann"] = current_price / df_raw["Ann_EPS"]
+
     merged_fcf = df_raw[["Period"]].merge(
         df_fcf[["Period", "FCF"]], on="Period", how="left"
     )
     df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
     df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
+
+  # Merge Capex into df_raw for Diluted Share Count & Capex chart
+  merged_capex = df_raw[["Period"]].merge(
+      df_fcf[["Period", "FCF"]], on="Period", how="left"
+  )
+  # Grab standalone capex from df_fcf logic or df_raw
+  df_raw["Capex_B"] = df_raw["Capex"] / 1e9
+  df_raw["Diluted_Shares_M"] = df_raw["Diluted_Shares"] / 1e6
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
@@ -403,11 +426,11 @@ try:
   st.pyplot(fig)
 
   st.markdown("---")
-  st.subheader(f"{ticker_symbol} — Valuation & Price Action Dashboard")
+  st.subheader(f"{ticker_symbol} — Valuation Multiples, Shares & Price Action")
 
   fig2, axes2 = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
   fig2.suptitle(
-      f"{ticker_symbol} Valuation Multiples & Price Action (50/200 EMA)",
+      f"{ticker_symbol} Price Action, TTM/Annualized Multiples & Capital Structure",
       fontsize=15,
       fontweight="bold",
       y=0.98,
@@ -445,55 +468,94 @@ try:
   ax_p1.legend(loc="upper left", fontsize=7)
   ax_p1.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 2: P/S Ratio over Quarters
+  # Valuation Chart 2: P/S Ratio (TTM vs Annualized Quarter)
   ax_p2 = axes2[0, 1]
   ax_p2.plot(
       df_raw["Period"],
-      df_raw["P_S_Ratio"],
+      df_raw["P_S_TTM"],
       color="#8B5CF6",
       marker="o",
       linewidth=2,
       label="P/S (TTM)",
   )
-  ax_p2.set_title("Price-to-Sales (P/S) Ratio", fontweight="bold", fontsize=10.5)
+  ax_p2.plot(
+      df_raw["Period"],
+      df_raw["P_S_Ann"],
+      color="#A78BFA",
+      marker="^",
+      linestyle="--",
+      linewidth=1.5,
+      label="P/S (Annualized Quarter)",
+  )
+  ax_p2.set_title(
+      "Price-to-Sales (P/S): TTM vs. Annualized Q", fontweight="bold", fontsize=10.5
+  )
   ax_p2.set_ylabel("P/S Multiple (x)", color="#6D28D9")
   ax_p2.tick_params(axis="x", rotation=45, labelsize=7)
   ax_p2.legend(loc="upper left", fontsize=7)
   ax_p2.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 3: P/E Ratio over Quarters
+  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter)
   ax_p3 = axes2[1, 0]
   ax_p3.plot(
       df_raw["Period"],
-      df_raw["P_E_Ratio"],
+      df_raw["P_E_TTM"],
       color="#10B981",
       marker="s",
       linewidth=2,
       label="P/E (TTM)",
   )
+  ax_p3.plot(
+      df_raw["Period"],
+      df_raw["P_E_Ann"],
+      color="#34D399",
+      marker="d",
+      linestyle="--",
+      linewidth=1.5,
+      label="P/E (Annualized Quarter)",
+  )
   ax_p3.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
-  ax_p3.set_title("Price-to-Earnings (P/E) Ratio", fontweight="bold", fontsize=10.5)
+  ax_p3.set_title(
+      "Price-to-Earnings (P/E): TTM vs. Annualized Q",
+      fontweight="bold",
+      fontsize=10.5,
+  )
   ax_p3.set_ylabel("P/E Multiple (x)", color="#047857")
   ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
-  axp3_legend = ax_p3.legend(loc="upper left", fontsize=7)
+  ax_p3.legend(loc="upper left", fontsize=7)
   ax_p3.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 4: FCF Yield Line Graph
+  # Valuation Chart 4: Diluted Share Count & Capex (Dual Axis)
   ax_p4 = axes2[1, 1]
   ax_p4.plot(
       df_raw["Period"],
-      df_raw["FCF_Yield_%"],
-      color="#F59E0B",
-      marker="^",
+      df_raw["Diluted_Shares_M"],
+      color="#2563EB",
+      marker="o",
       linewidth=2,
-      label="FCF Yield (%)",
+      label="Diluted Shares (Millions)",
   )
-  ax_p4.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
-  ax_p4.set_title("Free Cash Flow Yield (%)", fontweight="bold", fontsize=10.5)
-  ax_p4.set_ylabel("FCF Yield (%)", color="#B45309")
+  ax_p4.set_title(
+      "Diluted Share Count & Capital Expenditures", fontweight="bold", fontsize=10.5
+  )
+  ax_p4.set_ylabel("Diluted Shares (M)", color="#1D4ED8")
   ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
-  ax_p4.legend(loc="upper left", fontsize=7)
-  ax_p4.grid(True, linestyle="--", alpha=0.3)
+
+  ax_p4_sub = ax_p4.twinx()
+  ax_p4_sub.bar(
+      df_raw["Period"],
+      df_raw["Capex_B"],
+      color="#F59E0B",
+      alpha=0.55,
+      width=0.45,
+      label="Capex ($B)",
+  )
+  ax_p4_sub.set_ylabel("Capex ($ Billions)", color="#B45309")
+  ax_p4_sub.grid(False)
+
+  l4, lb4 = ax_p4.get_legend_handles_labels()
+  l4s, lb4s = ax_p4_sub.get_legend_handles_labels()
+  ax_p4.legend(l4 + l4s, lb4 + lb4s, loc="upper left", fontsize=6.5)
 
   plt.tight_layout(rect=[0, 0, 1, 0.98])
   st.pyplot(fig2)
