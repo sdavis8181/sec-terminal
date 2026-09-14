@@ -77,7 +77,7 @@ def fetch_and_parse_ticker(ticker):
   company = Company(ticker)
   filings_10q = company.get_filings(form="10-Q")[:40]
 
-  def parse_multi_val(df, keywords, min_val=None):
+  def parse_multi_val(df, keywords):
     if df is None:
       return np.nan
     for kw in keywords:
@@ -95,10 +95,7 @@ def fetch_and_parse_ticker(ticker):
                 .replace(")", "")
             )
             try:
-              val = float(val_str)
-              if min_val is not None and val < min_val:
-                continue
-              return val
+              return float(val_str)
             except:
               pass
     return np.nan
@@ -159,23 +156,12 @@ def fetch_and_parse_ticker(ticker):
     eps_diluted = parse_multi_val(
         inc_df,
         [
-            "Diluted",
             "Diluted earnings per share",
             "Earnings per share, diluted",
             "Diluted (in USD per share)",
             "Basic and diluted",
+            "Diluted",
         ],
-    )
-    diluted_shares = parse_multi_val(
-        inc_df,
-        [
-            "Weighted-average shares outstanding, diluted",
-            "Weighted average shares outstanding, diluted",
-            "Weighted average number of shares outstanding, diluted",
-            "Weighted average shares diluted",
-            "Diluted shares",
-        ],
-        min_val=100000,
     )
 
     ocf = get_exact_val(cf_df, "Net cash provided by operating activities")
@@ -187,7 +173,6 @@ def fetch_and_parse_ticker(ticker):
         "Operating_Income": op_inc,
         "Net_Income": net_inc,
         "Diluted_EPS": eps_diluted,
-        "Diluted_Shares": diluted_shares,
         "OCF": ocf,
         "Capex": capex,
     })
@@ -199,25 +184,31 @@ def fetch_and_parse_ticker(ticker):
   df["Rev_YoY_%"] = df["Revenue_B"].pct_change(periods=4, fill_method=None) * 100
   df["Rev_QoQ_%"] = df["Revenue_B"].pct_change(periods=1, fill_method=None) * 100
 
-  df["EPS_YoY_%"] = df["Diluted_EPS"].pct_change(
-      periods=4, fill_method=None
-  ) * 100
-  df["EPS_QoQ_%"] = df["Diluted_EPS"].pct_change(
-      periods=1, fill_method=None
-  ) * 100
+  # Clip extreme percentage growth outliers caused by near-zero denominators
+  df["EPS_YoY_%"] = (
+      df["Diluted_EPS"]
+      .pct_change(periods=4, fill_method=None)
+      .clip(lower=-300, upper=300)
+      * 100
+  )
+  df["EPS_QoQ_%"] = (
+      df["Diluted_EPS"]
+      .pct_change(periods=1, fill_method=None)
+      .clip(lower=-300, upper=300)
+      * 100
+  )
 
   df["Op_Margin_%"] = (df["Operating_Income"] / df["Revenue"]) * 100
   df["Net_Margin_%"] = (df["Net_Income"] / df["Revenue"]) * 100
 
   df["Capex_B"] = np.abs(df["Capex"]) / 1e9
-  df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
 
   df_fcf = calculate_fcf_from_raw(df)
   return df, df_fcf
 
 
 @st.cache_data(ttl=3600)
-def fetch_market_data(ticker):
+def fetch_market_and_shares(ticker):
   tk = yf.Ticker(ticker)
   info = tk.info
   market_cap = info.get("marketCap")
@@ -234,35 +225,58 @@ def fetch_market_data(ticker):
       current_price = hist["Close"].iloc[-1]
   if not market_cap and current_price and info.get("sharesOutstanding"):
     market_cap = current_price * info.get("sharesOutstanding")
-  return hist, current_price, market_cap
+
+  # Get historical quarterly share counts from yfinance if available
+  shares_df = None
+  try:
+    q_balance = tk.quarterly_balance_sheet
+    if q_balance is not None and not q_balance.empty:
+      if "Ordinary Shares Number" in q_balance.index:
+        shares_series = q_balance.loc["Ordinary Shares Number"] / 1e6
+        shares_df = pd.DataFrame(
+            {"Period": shares_series.index.astype(str), "Diluted_Shares_M": shares_series.values}
+        ).sort_values("Period")
+  except Exception:
+    pass
+
+  return hist, current_price, market_cap, shares_df
 
 
 try:
   with st.spinner(f"Extracting SEC XBRL filings & market data for {ticker_symbol}..."):
     df_raw_full, df_fcf_full = fetch_and_parse_ticker(ticker_symbol)
-    hist_price, current_price, market_cap = fetch_market_data(ticker_symbol)
+    hist_price, current_price, market_cap, yf_shares_df = fetch_market_and_shares(
+        ticker_symbol
+    )
+
+  # Merge share count if available from yfinance
+  if yf_shares_df is not None and not yf_shares_df.empty:
+    df_raw_full = pd.merge(df_raw_full, yf_shares_df, on="Period", how="left")
+  else:
+    df_raw_full["Diluted_Shares_M"] = np.nan
 
   # Local slice based on slider
   df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
   df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
-  # Calculate TTM & Annualized Quarter Valuation metrics
+  # Calculate TTM & Annualized Quarter Valuation metrics with outlier protection
   if market_cap:
     df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
     df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
-    df_raw["P_S_TTM"] = market_cap / df_raw["TTM_Revenue"]
-    df_raw["P_S_Ann"] = market_cap / df_raw["Ann_Revenue"]
+    df_raw["P_S_TTM"] = (market_cap / df_raw["TTM_Revenue"]).clip(lower=0, upper=100)
+    df_raw["P_S_Ann"] = (market_cap / df_raw["Ann_Revenue"]).clip(lower=0, upper=100)
 
     df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
     df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
-    df_raw["P_E_TTM"] = current_price / df_raw["TTM_EPS"]
-    df_raw["P_E_Ann"] = current_price / df_raw["Ann_EPS"]
+    # Clip P/E values between -100 and +150 to prevent near-zero EPS blowups
+    df_raw["P_E_TTM"] = (current_price / df_raw["TTM_EPS"]).clip(lower=-100, upper=150)
+    df_raw["P_E_Ann"] = (current_price / df_raw["Ann_EPS"]).clip(lower=-100, upper=150)
 
-    merged_fcf = df_fcf[["Period"]].merge(
-        df_raw[["Period", "Revenue"]], on="Period", how="left"
+    merged_fcf = df_raw[["Period"]].merge(
+        df_fcf[["Period", "FCF"]], on="Period", how="left"
     )
-    df_fcf["TTM_FCF"] = df_fcf["FCF"].rolling(4).sum()
-    df_fcf["FCF_Yield_%"] = (df_fcf["TTM_FCF"] / market_cap) * 100
+    df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
+    df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
@@ -351,7 +365,7 @@ try:
   l2s, lb2s = ax2_sub.get_legend_handles_labels()
   ax2.legend(l2 + l2s, lb2 + lb2s, loc="upper left", fontsize=6.5)
 
-  # 3. FCF (with FCF Yield plotted on twin axis)
+  # 3. FCF (Standalone FCF & Growth)
   ax3 = axes[1, 0]
   v_fcf = df_fcf.tail(lookback_quarters).reset_index(drop=True)
   v_fcf_clean = v_fcf.dropna(subset=["FCF_B"])
@@ -364,7 +378,7 @@ try:
       label="Free Cash Flow ($B)",
   )
   ax3.set_title(
-      "Standalone Free Cash Flow ($B), Growth & FCF Yield",
+      "Standalone Free Cash Flow ($B) & Growth",
       fontweight="bold",
       fontsize=10.5,
   )
@@ -388,21 +402,11 @@ try:
       linewidth=1.2,
       label="QoQ Growth (%)",
   )
-  if "FCF_Yield_%" in v_fcf_clean.columns:
-    ax3_sub.plot(
-        v_fcf_clean["Period"],
-        v_fcf_clean["FCF_Yield_%"],
-        color="#F59E0B",
-        marker="^",
-        linestyle="-.",
-        linewidth=2,
-        label="FCF Yield (%)",
-    )
-  ax3_sub.set_ylabel("Growth (%) / Yield (%)", fontsize=8)
+  ax3_sub.set_ylabel("Growth (%)", fontsize=8)
   ax3_sub.grid(False)
   l3, lb3 = ax3.get_legend_handles_labels()
   l3s, lb3s = ax3_sub.get_legend_handles_labels()
-  ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6)
+  ax3.legend(l3 + l3s, lb3 + lb3s, loc="upper left", fontsize=6.5)
 
   # 4. Margins (Line Chart)
   ax4 = axes[1, 1]
@@ -505,7 +509,7 @@ try:
   ax_p2.legend(loc="upper left", fontsize=7)
   ax_p2.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter)
+  # Valuation Chart 3: P/E Ratio (TTM vs Annualized Quarter - Bounded)
   ax_p3 = axes2[1, 0]
   ax_p3.plot(
       df_raw["Period"],
@@ -535,38 +539,23 @@ try:
   ax_p3.legend(loc="upper left", fontsize=7)
   ax_p3.grid(True, linestyle="--", alpha=0.3)
 
-  # Valuation Chart 4: Diluted Share Count & Capex (Dual Axis)
+  # Valuation Chart 4: Dedicated Free Cash Flow Yield (%)
   ax_p4 = axes2[1, 1]
-  v_shares = df_raw.dropna(subset=["Diluted_Shares_M"])
-  ax_p4.plot(
-      v_shares["Period"],
-      v_shares["Diluted_Shares_M"],
-      color="#2563EB",
-      marker="o",
-      linewidth=2,
-      label="Diluted Shares (Millions)",
-  )
-  ax_p4.set_title(
-      "Diluted Share Count & Capital Expenditures", fontweight="bold", fontsize=10.5
-  )
-  ax_p4.set_ylabel("Diluted Shares (M)", color="#1D4ED8")
+  if "FCF_Yield_%" in df_raw.columns:
+    ax_p4.plot(
+        df_raw["Period"],
+        df_raw["FCF_Yield_%"],
+        color="#F59E0B",
+        marker="^",
+        linewidth=2,
+        label="FCF Yield (TTM %)",
+    )
+  ax_p4.axhline(0, color="gray", linestyle=":", linewidth=1, alpha=0.6)
+  ax_p4.set_title("Free Cash Flow Yield (TTM %)", fontweight="bold", fontsize=10.5)
+  ax_p4.set_ylabel("FCF Yield (%)", color="#B45309")
   ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
-
-  ax_p4_sub = ax_p4.twinx()
-  ax_p4_sub.bar(
-      df_raw["Period"],
-      df_raw["Capex_B"],
-      color="#F59E0B",
-      alpha=0.55,
-      width=0.45,
-      label="Capex ($B)",
-  )
-  ax_p4_sub.set_ylabel("Capex ($ Billions)", color="#B45309")
-  ax_p4_sub.grid(False)
-
-  l4, lb4 = ax_p4.get_legend_handles_labels()
-  l4s, lb4s = ax_p4_sub.get_legend_handles_labels()
-  ax_p4.legend(l4 + l4s, lb4 + lb4s, loc="upper left", fontsize=6.5)
+  ax_p4.legend(loc="upper left", fontsize=7)
+  ax_p4.grid(True, linestyle="--", alpha=0.3)
 
   plt.tight_layout(rect=[0, 0, 1, 0.98])
   st.pyplot(fig2)
