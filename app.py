@@ -156,7 +156,6 @@ def fetch_and_parse_ticker(ticker):
     eps_diluted = parse_multi_val(
         inc_df,
         [
-            "Diluted",
             "Diluted earnings per share",
             "Earnings per share, diluted",
             "Diluted (in USD per share)",
@@ -167,9 +166,10 @@ def fetch_and_parse_ticker(ticker):
         inc_df,
         [
             "Weighted average shares diluted",
-            "Diluted shares",
             "Weighted average number of shares outstanding, diluted",
             "Weighted average shares outstanding, diluted",
+            "Weighted-average shares outstanding, diluted",
+            "Diluted shares",
         ],
     )
 
@@ -203,6 +203,9 @@ def fetch_and_parse_ticker(ticker):
 
   df["Op_Margin_%"] = (df["Operating_Income"] / df["Revenue"]) * 100
   df["Net_Margin_%"] = (df["Net_Income"] / df["Revenue"]) * 100
+
+  df["Capex_B"] = np.abs(df["Capex"]) / 1e9
+  df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
 
   df_fcf = calculate_fcf_from_raw(df)
   return df, df_fcf
@@ -255,14 +258,6 @@ try:
     )
     df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
     df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
-
-  # Merge Capex into df_raw for Diluted Share Count & Capex chart
-  merged_capex = df_raw[["Period"]].merge(
-      df_fcf[["Period", "FCF"]], on="Period", how="left"
-  )
-  # Grab standalone capex from df_fcf logic or df_raw
-  df_raw["Capex_B"] = df_raw["Capex"] / 1e9
-  df_raw["Diluted_Shares_M"] = df_raw["Diluted_Shares"] / 1e6
 
   st.subheader(f"{ticker_symbol} — Executive 2x2 Financial Dashboard")
 
