@@ -1,28 +1,20 @@
-from pathlib import Path
 import os
 import re
-import math
 import warnings
+from datetime import datetime, timezone
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
-from edgar import Company, set_identity
-
 warnings.filterwarnings("ignore")
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # CONFIG
-# ---------------------------------------------------------------------------
-
-EDGAR_IDENTITY = os.getenv(
-    "EDGAR_IDENTITY",
-    st.secrets.get("EDGAR_IDENTITY", "Scott Davis scott@example.com"),
-)
-set_identity(EDGAR_IDENTITY)
+# ============================================================
 
 st.set_page_config(
     page_title="SEC XBRL Financial Terminal",
@@ -32,13 +24,34 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Terminal")
 st.markdown(
-    "Enter a stock ticker to pull standardized quarterly financial data, "
-    "standalone quarterly cash flow, valuation history, and executive charts."
+    "Quarterly financial data from SEC XBRL, with Yahoo Finance used for "
+    "market-price history and as a limited fallback."
 )
 
-# ---------------------------------------------------------------------------
+DEFAULT_IDENTITY = "Scott Davis scott@example.com"
+try:
+    SEC_IDENTITY = st.secrets.get("EDGAR_IDENTITY", DEFAULT_IDENTITY)
+except Exception:
+    SEC_IDENTITY = os.getenv("EDGAR_IDENTITY", DEFAULT_IDENTITY)
+
+if not SEC_IDENTITY or "@" not in SEC_IDENTITY:
+    SEC_IDENTITY = DEFAULT_IDENTITY
+
+SEC_HEADERS = {
+    "User-Agent": SEC_IDENTITY,
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "data.sec.gov",
+}
+
+TICKER_HEADERS = {
+    "User-Agent": SEC_IDENTITY,
+    "Accept-Encoding": "gzip, deflate",
+    "Host": "www.sec.gov",
+}
+
+# ============================================================
 # SIDEBAR
-# ---------------------------------------------------------------------------
+# ============================================================
 
 with st.sidebar:
     st.header("Terminal Controls")
@@ -61,27 +74,32 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption(
-        "**Data hierarchy:** SEC XBRL/EdgarTools first; Yahoo Finance is used "
-        "as a fallback for financial data and for market-price history."
+        "SEC XBRL is the primary financial-statement source. "
+        "The parser uses individual XBRL facts and their actual reporting "
+        "periods instead of taking the first year-looking table column."
     )
     st.caption(
-        "**Audit advisory:** Cross-reference important XBRL values against "
-        "the company's official SEC filing before making investment decisions."
+        "Important: review the raw dataset for unusual reporting items "
+        "before relying on any derived valuation metric."
     )
 
 
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
 
 def clean_number(value):
-    """Convert common SEC/Yahoo numeric representations to float."""
     if value is None:
         return np.nan
 
     if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value) if pd.notna(value) else np.nan
+
+    try:
+        if pd.isna(value):
+            return np.nan
+    except Exception:
+        pass
 
     s = str(value).strip()
     if not s or s.lower() in {"nan", "none", "nat", "n/a", "na", "-"}:
@@ -103,31 +121,90 @@ def clean_number(value):
         return np.nan
 
 
-def normalize_label(value):
-    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
-
-
-def is_reasonable_numeric(x):
-    return pd.notna(x) and np.isfinite(x)
-
-
-def pct_change_safe(series, periods):
-    return series.pct_change(periods=periods, fill_method=None) * 100
-
-
 def safe_divide(a, b):
     a = pd.to_numeric(a, errors="coerce")
     b = pd.to_numeric(b, errors="coerce")
     return a / b.replace(0, np.nan)
 
 
-# ---------------------------------------------------------------------------
-# XBRL / SEC EXTRACTION
-# ---------------------------------------------------------------------------
+def pct_change_safe(series, periods):
+    return series.pct_change(periods=periods, fill_method=None) * 100
 
-CONCEPT_CANDIDATES = {
+
+def as_date(value):
+    return pd.to_datetime(value, errors="coerce")
+
+
+def normalize_text(value):
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+# ============================================================
+# SEC API
+# ============================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sec_ticker_map():
+    url = "https://www.sec.gov/files/company_tickers.json"
+    response = requests.get(url, headers=TICKER_HEADERS, timeout=30)
+    response.raise_for_status()
+
+    raw = response.json()
+    rows = []
+
+    for item in raw.values():
+        rows.append(
+            {
+                "ticker": str(item.get("ticker", "")).upper(),
+                "title": item.get("title", ""),
+                "cik": int(item.get("cik_str", 0)),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_cik_for_ticker(ticker):
+    df = get_sec_ticker_map()
+
+    match = df[df["ticker"].eq(ticker.upper())]
+
+    if match.empty:
+        raise ValueError(
+            f"{ticker} was not found in the SEC ticker list."
+        )
+
+    return int(match.iloc[0]["cik"])
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_companyfacts(cik):
+    url = (
+        "https://data.sec.gov/api/xbrl/companyfacts/CIK"
+        f"{int(cik):010d}.json"
+    )
+
+    response = requests.get(
+        url,
+        headers=SEC_HEADERS,
+        timeout=45,
+    )
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# XBRL FACT DEFINITIONS
+# ============================================================
+
+# Priority order matters. These are concept names, not loose labels.
+# We search US-GAAP first and IFRS-full second.
+FLOW_CONCEPTS = {
     "Revenue": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
         "Revenues",
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
@@ -135,17 +212,14 @@ CONCEPT_CANDIDATES = {
     ],
     "Operating_Income": [
         "OperatingIncomeLoss",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     ],
     "Net_Income": [
         "NetIncomeLoss",
         "ProfitLoss",
-        "NetIncomeLossAvailableToCommonStockholdersBasic",
     ],
     "Diluted_EPS": [
         "EarningsPerShareDiluted",
         "EarningsPerShareBasicAndDiluted",
-        "BasicAndDilutedEarningsPerShare",
     ],
     "Diluted_Shares": [
         "WeightedAverageNumberOfDilutedSharesOutstanding",
@@ -154,202 +228,389 @@ CONCEPT_CANDIDATES = {
     "OCF": [
         "NetCashProvidedByUsedInOperatingActivities",
         "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        "CashFlowsFromUsedInOperatingActivities",
     ],
     "Capex": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
-        "PaymentsForProceedsFromOtherPropertyPlantAndEquipment",
-        "PaymentsToAcquireProductiveAssets",
+        "PurchaseOfPropertyPlantAndEquipment",
+        "PaymentsForAdditionsToPropertyPlantAndEquipment",
+        "PaymentsToAcquirePropertyPlantAndEquipmentAndOtherPropertyPlantAndEquipment",
     ],
 }
 
+# Some foreign filers use IFRS concepts whose exact names differ.
+# The label matching below is deliberately conservative and only used if
+# no preferred concept is available.
+LABEL_FALLBACKS = {
+    "Revenue": [
+        "revenue",
+        "sales",
+    ],
+    "Operating_Income": [
+        "operating profit",
+        "operating income",
+    ],
+    "Net_Income": [
+        "profit loss",
+        "profit for the period",
+        "net income",
+    ],
+    "Diluted_EPS": [
+        "diluted earnings per share",
+    ],
+    "Diluted_Shares": [
+        "weighted average number of diluted shares",
+    ],
+    "OCF": [
+        "cash flows from operating activities",
+        "net cash from operating activities",
+    ],
+    "Capex": [
+        "purchase of property plant and equipment",
+        "payments to acquire property plant and equipment",
+    ],
+}
 
-def find_statement_value(statement_df, candidates):
-    """Find a statement value using standardized XBRL concept/label information."""
-    if statement_df is None or statement_df.empty:
-        return np.nan
-
-    df = statement_df.copy()
-
-    concept_col = None
-    for c in ["standard_concept", "concept", "label", "name"]:
-        if c in df.columns:
-            concept_col = c
-            break
-
-    if concept_col is None:
-        working = df.copy()
-        working["_row_text"] = working.index.astype(str)
-    else:
-        working = df.copy()
-        working["_row_text"] = working[concept_col].astype(str)
-
-    for candidate in candidates:
-        candidate_norm = normalize_label(candidate)
-
-        exact = working[
-            working["_row_text"].map(normalize_label) == candidate_norm
-        ]
-        if not exact.empty:
-            row = exact.iloc[0]
-            value = _latest_numeric_period_value(row)
-            if is_reasonable_numeric(value):
-                return value
-
-    candidate_words = [normalize_label(x) for x in candidates]
-    mask = working["_row_text"].map(
-        lambda x: any(cw in normalize_label(x) for cw in candidate_words)
-    )
-    matches = working[mask]
-
-    if len(matches) == 1:
-        return _latest_numeric_period_value(matches.iloc[0])
-
-    return np.nan
+FLOW_FIELDS = [
+    "Revenue",
+    "Operating_Income",
+    "Net_Income",
+    "Diluted_EPS",
+    "Diluted_Shares",
+    "OCF",
+    "Capex",
+]
 
 
-def _latest_numeric_period_value(row):
-    """Select a numeric value from a statement row."""
+# ============================================================
+# FACT UTILITIES
+# ============================================================
+
+def all_fact_candidates(companyfacts, field):
+    """
+    Return preferred XBRL concepts for a requested metric.
+
+    Company Facts are organized by taxonomy -> concept -> units.
+    """
+    facts = companyfacts.get("facts", {})
+
+    preferred = FLOW_CONCEPTS.get(field, [])
+
+    # Search all taxonomies, preserving preferred concept order.
     candidates = []
 
-    for col in row.index:
-        if str(col).startswith("_"):
+    for taxonomy, taxonomy_facts in facts.items():
+        if not isinstance(taxonomy_facts, dict):
             continue
 
-        value = clean_number(row[col])
-        if not is_reasonable_numeric(value):
+        for concept in preferred:
+            if concept in taxonomy_facts:
+                candidates.append(
+                    (
+                        taxonomy,
+                        concept,
+                        taxonomy_facts[concept],
+                    )
+                )
+
+    return candidates
+
+
+def choose_unit_name(concept_data, field):
+    units = concept_data.get("units", {})
+
+    if not units:
+        return None
+
+    if field == "Diluted_EPS":
+        for unit in ["USD/shares", "USD / shares", "EUR/shares"]:
+            if unit in units:
+                return unit
+
+    if field == "Diluted_Shares":
+        for unit in ["shares"]:
+            if unit in units:
+                return unit
+
+    if field in {
+        "Revenue",
+        "Operating_Income",
+        "Net_Income",
+        "OCF",
+        "Capex",
+    }:
+        for unit in ["USD", "EUR", "BRL", "ARS"]:
+            if unit in units:
+                return unit
+
+        # If there is only one monetary unit, use it.
+        if len(units) == 1:
+            return next(iter(units.keys()))
+
+    if len(units) == 1:
+        return next(iter(units.keys()))
+
+    return None
+
+
+def get_preferred_entries(companyfacts, field):
+    """
+    Retrieve all entries for the first useful XBRL concept.
+
+    We do not mix concepts unless the preferred concept has no usable data.
+    """
+    candidates = all_fact_candidates(companyfacts, field)
+
+    for taxonomy, concept, concept_data in candidates:
+        unit = choose_unit_name(concept_data, field)
+
+        if not unit:
             continue
 
-        text = str(col)
-        if any(
-            x in text.lower()
-            for x in ["label", "concept", "standard_concept", "units"]
-        ):
+        entries = concept_data["units"].get(unit, [])
+        usable = [
+            x for x in entries
+            if isinstance(x, dict) and "val" in x
+        ]
+
+        if usable:
+            return {
+                "taxonomy": taxonomy,
+                "concept": concept,
+                "unit": unit,
+                "entries": usable,
+            }
+
+    return None
+
+
+def entry_date(entry, key):
+    return as_date(entry.get(key))
+
+
+def entry_duration_days(entry):
+    start = entry_date(entry, "start")
+    end = entry_date(entry, "end")
+
+    if pd.isna(start) or pd.isna(end):
+        return None
+
+    return (end - start).days + 1
+
+
+def entry_is_flow(entry):
+    return "start" in entry and "end" in entry
+
+
+def quarter_from_frame(frame):
+    """
+    SEC 'frame' values are the cleanest way to identify standalone calendar
+    quarters for flow facts.
+
+    Examples:
+      CY2025Q1
+      CY2025Q2
+      CY2025Q3
+      CY2025Q4
+    """
+    if not frame:
+        return None
+
+    match = re.search(r"CY(\d{4})Q([1-4])", str(frame))
+    if not match:
+        return None
+
+    return pd.Timestamp(
+        year=int(match.group(1)),
+        month=int(match.group(2)) * 3,
+        day=1,
+    ) + pd.offsets.MonthEnd(0)
+
+
+def standalone_quarter_candidates(entries):
+    """
+    Select entries that look like standalone quarters.
+
+    Preference:
+      1. SEC frame CYyyyyQn
+      2. duration of roughly one quarter
+      3. 10-Q/20-F quarterly filings
+
+    We explicitly reject 6-, 9-, and 12-month cumulative periods here.
+    """
+    output = []
+
+    for e in entries:
+        if not entry_is_flow(e):
             continue
 
-        score = 0
-        upper = text.upper()
+        days = entry_duration_days(e)
+        if days is None:
+            continue
 
-        if "Q" in upper:
-            score += 10
-        if "FY" in upper:
-            score += 3
-        if "202" in upper:
-            score += 2
+        form = str(e.get("form", "")).upper()
+        frame = str(e.get("frame", ""))
 
-        candidates.append((score, text, value))
+        q_end = quarter_from_frame(frame)
 
+        if q_end is not None:
+            # Frames are a strong indicator of a standalone calendar quarter.
+            # A Q4 annual frame can also occur, but annual filings are handled
+            # separately below.
+            output.append(
+                {
+                    "entry": e,
+                    "period": q_end,
+                    "method": "SEC frame",
+                    "score": 100,
+                }
+            )
+            continue
+
+        # Typical standalone quarter duration:
+        # allow a broad range because 52/53-week fiscal quarters exist.
+        if 70 <= days <= 110:
+            end = entry_date(e, "end")
+            score = 50
+
+            if form in {"10-Q", "20-F", "6-K"}:
+                score += 10
+
+            output.append(
+                {
+                    "entry": e,
+                    "period": end,
+                    "method": "duration",
+                    "score": score,
+                }
+            )
+
+    return output
+
+
+def annual_candidates(entries):
+    output = []
+
+    for e in entries:
+        if not entry_is_flow(e):
+            continue
+
+        days = entry_duration_days(e)
+        if days is None:
+            continue
+
+        form = str(e.get("form", "")).upper()
+
+        # Annual period. 53-week years are covered.
+        if 320 <= days <= 390 and form in {"10-K", "20-F"}:
+            output.append(e)
+
+    return output
+
+
+def pick_best_entry(candidates):
     if not candidates:
-        return np.nan
+        return None
 
-    candidates.sort(key=lambda x: (x[0], x[1]))
-    return candidates[-1][2]
+    # Prefer the latest filed version, then the latest accession.
+    def sort_key(x):
+        e = x["entry"] if "entry" in x else x
+        filed = str(e.get("filed", ""))
+        accession = str(e.get("accn", ""))
+        return (filed, accession)
 
-
-def _period_from_filing(filing):
-    """Get filing report date safely."""
-    try:
-        return pd.to_datetime(str(filing.period_of_report)[:10], errors="coerce")
-    except Exception:
-        return pd.NaT
+    return sorted(candidates, key=sort_key)[-1]
 
 
-def _extract_from_edgar_statements(ticker):
-    """Primary SEC path."""
-    records = []
-    diagnostics = []
+# ============================================================
+# BUILD QUARTERLY DATA
+# ============================================================
 
-    try:
-        company = Company(ticker)
-        filings = company.get_filings(form=["10-Q", "10-K", "20-F"])
-        filings = list(filings)[:60]
+def build_quarterly_fact_table(companyfacts):
+    """
+    Build a normalized quarterly dataset directly from SEC Company Facts.
 
-        for filing in filings:
-            period = _period_from_filing(filing)
+    This is the critical change from the previous version:
+    we never select 'the first column containing 2025' from a statement table.
+    We select individual XBRL facts by their reporting period.
+    """
+    fact_meta = {}
+    quarter_rows = {}
+
+    for field in FLOW_FIELDS:
+        meta = get_preferred_entries(companyfacts, field)
+
+        if not meta:
+            fact_meta[field] = None
+            continue
+
+        fact_meta[field] = meta
+
+        entries = meta["entries"]
+        candidates = standalone_quarter_candidates(entries)
+
+        # Group candidate observations by quarter-end.
+        grouped = {}
+
+        for item in candidates:
+            period = item["period"]
+
             if pd.isna(period):
                 continue
 
-            form = str(getattr(filing, "form", ""))
+            key = period.strftime("%Y-%m-%d")
 
-            try:
-                obj = filing.obj()
+            grouped.setdefault(key, []).append(item)
 
-                inc = getattr(obj, "income_statement", None)
-                cf = getattr(obj, "cash_flow_statement", None)
+        for key, group in grouped.items():
+            best = pick_best_entry(group)
 
-                inc_df = (
-                    inc.to_dataframe(view="standard")
-                    if inc is not None
-                    else None
-                )
-                cf_df = (
-                    cf.to_dataframe(view="standard") if cf is not None else None
-                )
-
-                if inc_df is None or inc_df.empty:
-                    continue
-
-                record = {
-                    "Period": period,
-                    "Form": form,
-                    "Source": "SEC XBRL",
-                    "Revenue": find_statement_value(
-                        inc_df, CONCEPT_CANDIDATES["Revenue"]
-                    ),
-                    "Operating_Income": find_statement_value(
-                        inc_df, CONCEPT_CANDIDATES["Operating_Income"]
-                    ),
-                    "Net_Income": find_statement_value(
-                        inc_df, CONCEPT_CANDIDATES["Net_Income"]
-                    ),
-                    "Diluted_EPS": find_statement_value(
-                        inc_df, CONCEPT_CANDIDATES["Diluted_EPS"]
-                    ),
-                    "Diluted_Shares": find_statement_value(
-                        inc_df, CONCEPT_CANDIDATES["Diluted_Shares"]
-                    ),
-                    "OCF": find_statement_value(
-                        cf_df, CONCEPT_CANDIDATES["OCF"]
-                    ),
-                    "Capex": find_statement_value(
-                        cf_df, CONCEPT_CANDIDATES["Capex"]
-                    ),
-                }
-
-                if is_reasonable_numeric(record["Revenue"]) or is_reasonable_numeric(
-                    record["Net_Income"]
-                ):
-                    records.append(record)
-
-            except Exception as exc:
-                diagnostics.append(
-                    f"{period.date()} {form}: {type(exc).__name__}: {exc}"
-                )
+            if best is None:
                 continue
 
-    except Exception as exc:
-        diagnostics.append(
-            f"SEC company/fillings error: {type(exc).__name__}: {exc}"
-        )
+            entry = best["entry"]
 
-    if not records:
-        return pd.DataFrame(), diagnostics
+            quarter_rows.setdefault(
+                key,
+                {
+                    "Period": best["period"],
+                    "Source": "SEC XBRL",
+                },
+            )
 
-    df = pd.DataFrame(records)
-    df["completeness"] = df.notna().sum(axis=1)
+            quarter_rows[key][field] = clean_number(
+                entry.get("val")
+            )
+
+            quarter_rows[key][f"{field}_Concept"] = (
+                f"{meta['taxonomy']}:{meta['concept']}"
+            )
+
+            quarter_rows[key][f"{field}_Method"] = best["method"]
+
+    df = pd.DataFrame(list(quarter_rows.values()))
+
+    if df.empty:
+        return df, fact_meta
+
+    df["Period"] = pd.to_datetime(df["Period"], errors="coerce")
 
     df = (
-        df.sort_values(["Period", "completeness"], ascending=[True, False])
-        .drop_duplicates("Period", keep="first")
-        .drop(columns=["completeness"])
+        df.dropna(subset=["Period"])
+        .sort_values("Period")
+        .drop_duplicates("Period", keep="last")
         .reset_index(drop=True)
     )
 
-    return df, diagnostics
+    # Remove obvious pre-2018 junk from a modern dashboard.
+    df = df[df["Period"] >= pd.Timestamp("2017-01-01")].reset_index(drop=True)
+
+    return df, fact_meta
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # YAHOO FALLBACK / SUPPLEMENT
-# ---------------------------------------------------------------------------
+# ============================================================
 
 YF_KEYS = {
     "Revenue": [
@@ -370,12 +631,10 @@ YF_KEYS = {
     "Diluted_EPS": [
         "Diluted EPS",
         "Diluted EPS From Continuing Operations",
-        "Basic EPS",
     ],
     "Diluted_Shares": [
         "Diluted Average Shares",
         "Diluted Average Shares Outstanding",
-        "Basic Average Shares",
     ],
     "OCF": [
         "Operating Cash Flow",
@@ -397,15 +656,15 @@ def yahoo_row_value(df, keys, date_col):
     for key in keys:
         if key in df.index:
             try:
-                value = df.loc[key, date_col]
-                return clean_number(value)
+                return clean_number(df.loc[key, date_col])
             except Exception:
-                continue
+                pass
+
     return np.nan
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yahoo_quarterly(ticker):
-    """Yahoo fallback."""
     diagnostics = []
 
     try:
@@ -417,17 +676,17 @@ def fetch_yahoo_quarterly(ticker):
         if inc is None or inc.empty:
             return pd.DataFrame(), ["Yahoo quarterly income statement empty"]
 
-        records = []
+        rows = []
 
         for date_col in inc.columns:
             period = pd.to_datetime(date_col, errors="coerce")
+
             if pd.isna(period):
                 continue
 
-            records.append(
+            rows.append(
                 {
                     "Period": period,
-                    "Form": "Yahoo",
                     "Source": "Yahoo Finance",
                     "Revenue": yahoo_row_value(
                         inc, YF_KEYS["Revenue"], date_col
@@ -444,29 +703,39 @@ def fetch_yahoo_quarterly(ticker):
                     "Diluted_Shares": yahoo_row_value(
                         inc, YF_KEYS["Diluted_Shares"], date_col
                     ),
-                    "OCF": yahoo_row_value(cf, YF_KEYS["OCF"], date_col),
-                    "Capex": yahoo_row_value(cf, YF_KEYS["Capex"], date_col),
+                    "OCF": yahoo_row_value(
+                        cf, YF_KEYS["OCF"], date_col
+                    ),
+                    "Capex": yahoo_row_value(
+                        cf, YF_KEYS["Capex"], date_col
+                    ),
                 }
             )
 
-        return pd.DataFrame(records), diagnostics
+        return pd.DataFrame(rows), diagnostics
 
     except Exception as exc:
-        diagnostics.append(f"Yahoo error: {type(exc).__name__}: {exc}")
-        return pd.DataFrame(), diagnostics
+        return pd.DataFrame(), [
+            f"Yahoo error: {type(exc).__name__}: {exc}"
+        ]
 
 
-def merge_sec_and_yahoo(sec_df, yf_df):
-    """SEC is authoritative where a value exists. Yahoo fills missing fields."""
+def merge_sec_yahoo(sec_df, yahoo_df):
+    """
+    SEC wins whenever a SEC value exists.
+
+    Yahoo only fills a missing SEC field or an SEC period that is completely
+    absent. This prevents the old behavior where a weak Yahoo result could
+    overwrite the SEC series.
+    """
     if sec_df.empty:
-        return yf_df.copy()
+        return yahoo_df.copy()
 
-    if yf_df.empty:
+    if yahoo_df.empty:
         return sec_df.copy()
 
-    all_cols = [
+    cols = [
         "Period",
-        "Form",
         "Source",
         "Revenue",
         "Operating_Income",
@@ -477,166 +746,96 @@ def merge_sec_and_yahoo(sec_df, yf_df):
         "Capex",
     ]
 
-    sec = sec_df.copy()
-    yahoo = yf_df.copy()
-
-    for df in [sec, yahoo]:
-        for col in all_cols:
+    for df in [sec_df, yahoo_df]:
+        for col in cols:
             if col not in df.columns:
                 df[col] = np.nan
 
-    combined = pd.concat(
-        [sec[all_cols], yahoo[all_cols]],
-        ignore_index=True,
-    )
+    sec = sec_df.copy()
+    yf_df = yahoo_df.copy()
 
-    combined["source_priority"] = np.where(
-        combined["Source"].eq("SEC XBRL"), 0, 1
-    )
+    sec["Period"] = pd.to_datetime(sec["Period"], errors="coerce")
+    yf_df["Period"] = pd.to_datetime(yf_df["Period"], errors="coerce")
 
-    combined = combined.sort_values(["Period", "source_priority"])
+    sec_indexed = sec.set_index("Period")
+    yf_indexed = yf_df.set_index("Period")
+
+    all_periods = sorted(
+        set(sec_indexed.index.dropna())
+        | set(yf_indexed.index.dropna())
+    )
 
     output = []
 
-    for period, group in combined.groupby("Period", sort=True):
-        row = {
-            "Period": period,
-            "Form": group.iloc[0]["Form"],
-            "Source": group.iloc[0]["Source"],
-        }
+    for period in all_periods:
+        if period in sec_indexed.index:
+            row = sec_indexed.loc[period]
 
-        for col in [
-            "Revenue",
-            "Operating_Income",
-            "Net_Income",
-            "Diluted_EPS",
-            "Diluted_Shares",
-            "OCF",
-            "Capex",
-        ]:
-            values = pd.to_numeric(group[col], errors="coerce").dropna()
-            row[col] = values.iloc[0] if not values.empty else np.nan
+            if isinstance(row, pd.DataFrame):
+                row = row.iloc[-1]
 
-        if len(group) > 1:
-            sec_row = group[group["Source"].eq("SEC XBRL")]
-            yf_row = group[group["Source"].eq("Yahoo Finance")]
+            result = {
+                "Period": period,
+                "Source": "SEC XBRL",
+            }
 
-            if not sec_row.empty and not yf_row.empty:
-                for col in [
-                    "Revenue",
-                    "Operating_Income",
-                    "Net_Income",
-                    "Diluted_EPS",
-                    "Diluted_Shares",
-                    "OCF",
-                    "Capex",
-                ]:
-                    sec_value = pd.to_numeric(
-                        sec_row.iloc[0][col], errors="coerce"
+            for col in cols[2:]:
+                value = clean_number(row.get(col, np.nan))
+
+                if pd.notna(value):
+                    result[col] = value
+                elif period in yf_indexed.index:
+                    yfrow = yf_indexed.loc[period]
+
+                    if isinstance(yfrow, pd.DataFrame):
+                        yfrow = yfrow.iloc[-1]
+
+                    result[col] = clean_number(
+                        yfrow.get(col, np.nan)
                     )
-                    yf_value = pd.to_numeric(
-                        yf_row.iloc[0][col], errors="coerce"
-                    )
+                    if pd.notna(result[col]):
+                        result["Source"] = "SEC + Yahoo"
+                else:
+                    result[col] = np.nan
 
-                    if pd.isna(sec_value) and pd.notna(yf_value):
-                        row[col] = yf_value
-                        row["Source"] = "SEC + Yahoo"
+            # Preserve SEC concept/method columns where available.
+            for c in sec.columns:
+                if c.endswith("_Concept") or c.endswith("_Method"):
+                    result[c] = row.get(c, None)
 
-        output.append(row)
+            output.append(result)
 
-    return pd.DataFrame(output)
-
-
-# ---------------------------------------------------------------------------
-# CASH FLOW NORMALIZATION
-# ---------------------------------------------------------------------------
-
-
-def calculate_fcf_safe(df):
-    """Calculate standalone FCF."""
-    if df.empty:
-        return pd.DataFrame(columns=["Period", "FCF", "FCF_B"])
-
-    work = df[["Period", "OCF", "Capex"]].copy()
-    work["Period"] = pd.to_datetime(work["Period"], errors="coerce")
-    work["OCF"] = pd.to_numeric(work["OCF"], errors="coerce")
-    work["Capex"] = pd.to_numeric(work["Capex"], errors="coerce")
-    work = work.sort_values("Period").reset_index(drop=True)
-
-    standalone_ocf = []
-    standalone_capex = []
-
-    prev_year = None
-    prev_ocf_ytd = np.nan
-    prev_capex_ytd = np.nan
-
-    for _, row in work.iterrows():
-        p_date = row["Period"]
-        curr_year = p_date.year if pd.notna(p_date) else None
-        month = p_date.month if pd.notna(p_date) else 3
-
-        ocf = row["OCF"]
-        capex = row["Capex"]
-
-        if curr_year != prev_year or month <= 4:
-            q_ocf = ocf
-            q_capex = capex
         else:
-            q_ocf = ocf - prev_ocf_ytd if pd.notna(prev_ocf_ytd) else ocf
-            q_capex = capex - prev_capex_ytd if pd.notna(prev_capex_ytd) else capex
+            yfrow = yf_indexed.loc[period]
 
-        standalone_ocf.append(q_ocf)
-        standalone_capex.append(q_capex)
+            if isinstance(yfrow, pd.DataFrame):
+                yfrow = yfrow.iloc[-1]
 
-        prev_year = curr_year
-        prev_ocf_ytd = ocf
-        prev_capex_ytd = capex
+            result = {
+                "Period": period,
+                "Source": "Yahoo Finance",
+            }
 
-    # Convert pandas NA/None/strings safely before NumPy arithmetic.
-    # np.array([...], dtype=float) raises TypeError when a list contains pd.NA.
-    ocf_series = pd.to_numeric(
-        pd.Series(standalone_ocf, index=work.index),
-        errors="coerce",
-    ).astype(float)
+            for col in cols[2:]:
+                result[col] = clean_number(
+                    yfrow.get(col, np.nan)
+                )
 
-    capex_series = pd.to_numeric(
-        pd.Series(standalone_capex, index=work.index),
-        errors="coerce",
-    ).astype(float)
+            output.append(result)
 
-    fcf = ocf_series.to_numpy() - np.abs(capex_series.to_numpy())
-
-    out = pd.DataFrame(
-        {
-            "Period": work["Period"],
-            "FCF": fcf,
-        }
+    return (
+        pd.DataFrame(output)
+        .sort_values("Period")
+        .reset_index(drop=True)
     )
 
-    out["FCF_B"] = out["FCF"] / 1e9
-    out["FCF_YoY_%"] = pct_change_safe(out["FCF"], 4).clip(-200, 200)
-    out["FCF_QoQ_%"] = pct_change_safe(out["FCF"], 1).clip(-200, 200)
 
-    return out
+# ============================================================
+# FINANCIAL DERIVATIONS
+# ============================================================
 
-
-# ---------------------------------------------------------------------------
-# MAIN DATA FETCH
-# ---------------------------------------------------------------------------
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_and_parse_ticker(ticker):
-    sec_df, sec_diag = _extract_from_edgar_statements(ticker)
-    yf_df, yf_diag = fetch_yahoo_quarterly(ticker)
-
-    df = merge_sec_and_yahoo(sec_df, yf_df)
-
-    if df.empty:
-        raise ValueError(
-            f"No usable quarterly financial data found for {ticker}. "
-            f"SEC diagnostics: {sec_diag[-2:]}; Yahoo diagnostics: {yf_diag[-2:]}"
-        )
+def calculate_metrics(df):
+    work = df.copy()
 
     numeric_cols = [
         "Revenue",
@@ -649,48 +848,105 @@ def fetch_and_parse_ticker(ticker):
     ]
 
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col not in work.columns:
+            work[col] = np.nan
+        work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    df = (
-        df.sort_values("Period")
-        .drop_duplicates("Period", keep="last")
-        .reset_index(drop=True)
+    work["Revenue_B"] = work["Revenue"] / 1e9
+
+    work["Rev_YoY_%"] = pct_change_safe(
+        work["Revenue_B"], 4
     )
 
-    implied_shares = safe_divide(df["Net_Income"], df["Diluted_EPS"])
-    missing_shares = df["Diluted_Shares"].isna()
-    df.loc[missing_shares, "Diluted_Shares"] = implied_shares[missing_shares]
+    work["Rev_QoQ_%"] = pct_change_safe(
+        work["Revenue_B"], 1
+    )
 
-    df["Revenue_B"] = df["Revenue"] / 1e9
-    df["Rev_YoY_%"] = pct_change_safe(df["Revenue_B"], 4)
-    df["Rev_QoQ_%"] = pct_change_safe(df["Revenue_B"], 1)
+    work["EPS_YoY_%"] = pct_change_safe(
+        work["Diluted_EPS"], 4
+    ).clip(-500, 500)
 
-    df["EPS_YoY_%"] = pct_change_safe(df["Diluted_EPS"], 4).clip(-200, 200)
-    df["EPS_QoQ_%"] = pct_change_safe(df["Diluted_EPS"], 1).clip(-200, 200)
+    work["EPS_QoQ_%"] = pct_change_safe(
+        work["Diluted_EPS"], 1
+    ).clip(-500, 500)
 
-    df["Op_Margin_%"] = safe_divide(df["Operating_Income"], df["Revenue"]) * 100
+    work["Op_Margin_%"] = (
+        safe_divide(
+            work["Operating_Income"],
+            work["Revenue"],
+        )
+        * 100
+    )
 
-    df["Net_Margin_%"] = safe_divide(df["Net_Income"], df["Revenue"]) * 100
+    work["Net_Margin_%"] = (
+        safe_divide(
+            work["Net_Income"],
+            work["Revenue"],
+        )
+        * 100
+    )
 
-    df["Capex_B"] = np.abs(df["Capex"]) / 1e9
-    df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
+    work["Diluted_Shares_M"] = (
+        work["Diluted_Shares"] / 1e6
+    )
 
-    df["Share_Dilution_YoY_%"] = pct_change_safe(
-        df["Diluted_Shares_M"], 4
-    ).clip(-25, 25)
+    work["Share_Dilution_YoY_%"] = pct_change_safe(
+        work["Diluted_Shares_M"], 4
+    ).clip(-50, 50)
 
-    fcf_df = calculate_fcf_safe(df)
-
-    return df, fcf_df, sec_diag, yf_diag
+    return work
 
 
-# ---------------------------------------------------------------------------
+def calculate_fcf(df):
+    """
+    FCF is only calculated from values that are already represented as
+    standalone quarterly cash-flow facts.
+
+    We do NOT perform the old heuristic 'subtract previous YTD if the value
+    is bigger'. That heuristic was one of the sources of bad FCF output.
+
+    If SEC provides a standalone quarterly fact, use it.
+    If Yahoo supplies the quarter, Yahoo's quarterly statement is used.
+    """
+    work = df[
+        ["Period", "OCF", "Capex", "Source"]
+    ].copy()
+
+    work["OCF"] = pd.to_numeric(
+        work["OCF"], errors="coerce"
+    )
+
+    work["Capex"] = pd.to_numeric(
+        work["Capex"], errors="coerce"
+    )
+
+    # Capex is normally reported as a negative cash flow in SEC data.
+    # We want FCF = OCF - positive Capex.
+    work["Capex_Positive"] = work["Capex"].abs()
+
+    work["FCF"] = (
+        work["OCF"] - work["Capex_Positive"]
+    )
+
+    work["FCF_B"] = work["FCF"] / 1e9
+
+    work["FCF_YoY_%"] = pct_change_safe(
+        work["FCF"], 4
+    ).clip(-500, 500)
+
+    work["FCF_QoQ_%"] = pct_change_safe(
+        work["FCF"], 1
+    ).clip(-500, 500)
+
+    return work
+
+
+# ============================================================
 # MARKET DATA
-# ---------------------------------------------------------------------------
-
+# ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_market_and_shares(ticker):
+def fetch_market_data(ticker):
     try:
         tk = yf.Ticker(ticker)
 
@@ -698,98 +954,216 @@ def fetch_market_and_shares(ticker):
         try:
             info = tk.info or {}
         except Exception:
-            info = {}
+            pass
 
-        market_cap = info.get("marketCap")
         current_price = (
             info.get("currentPrice")
             or info.get("regularMarketPrice")
             or info.get("previousClose")
         )
 
-        hist = tk.history(period="2y", auto_adjust=False)
+        shares_outstanding = info.get(
+            "sharesOutstanding"
+        )
 
-        if not hist.empty and "Close" in hist.columns:
+        market_cap = info.get("marketCap")
+
+        hist = tk.history(
+            period="2y",
+            auto_adjust=False,
+        )
+
+        if (
+            current_price is None
+            and hist is not None
+            and not hist.empty
+        ):
+            current_price = clean_number(
+                hist["Close"].iloc[-1]
+            )
+
+        if (
+            market_cap is None
+            and current_price is not None
+            and shares_outstanding is not None
+        ):
+            market_cap = (
+                current_price * shares_outstanding
+            )
+
+        if hist is not None and not hist.empty:
             hist = hist.copy()
-            hist["EMA50"] = hist["Close"].ewm(
-                span=50, adjust=False
-            ).mean()
-            hist["EMA200"] = hist["Close"].ewm(
-                span=200, adjust=False
-            ).mean()
 
-            if not current_price:
-                current_price = hist["Close"].iloc[-1]
+            hist["EMA50"] = (
+                hist["Close"]
+                .ewm(span=50, adjust=False)
+                .mean()
+            )
 
-        shares_outstanding = info.get("sharesOutstanding")
+            hist["EMA200"] = (
+                hist["Close"]
+                .ewm(span=200, adjust=False)
+                .mean()
+            )
 
-        if not market_cap and current_price and shares_outstanding:
-            market_cap = current_price * shares_outstanding
-
-        return hist, current_price, market_cap, shares_outstanding
+        return (
+            hist,
+            clean_number(current_price),
+            clean_number(market_cap),
+            clean_number(shares_outstanding),
+        )
 
     except Exception:
-        return pd.DataFrame(), None, None, None
+        return pd.DataFrame(), np.nan, np.nan, np.nan
 
 
-# ---------------------------------------------------------------------------
-# REPORT
-# ---------------------------------------------------------------------------
+# ============================================================
+# SEC DATA PIPELINE
+# ============================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_and_parse_ticker(ticker):
+    diagnostics = []
+
+    cik = get_cik_for_ticker(ticker)
+    companyfacts = get_companyfacts(cik)
+
+    sec_df, fact_meta = build_quarterly_fact_table(
+        companyfacts
+    )
+
+    if sec_df.empty:
+        diagnostics.append(
+            "SEC Company Facts did not yield standalone quarterly flow facts."
+        )
+
+    yahoo_df, yahoo_diag = fetch_yahoo_quarterly(ticker)
+
+    diagnostics.extend(yahoo_diag)
+
+    df = merge_sec_yahoo(
+        sec_df,
+        yahoo_df,
+    )
+
+    if df.empty:
+        raise ValueError(
+            f"No usable quarterly data found for {ticker}."
+        )
+
+    df = calculate_metrics(df)
+
+    # Last-resort share-count inference only where actual diluted share data
+    # is unavailable. It is explicitly marked in the dataset.
+    implied = safe_divide(
+        df["Net_Income"],
+        df["Diluted_EPS"],
+    )
+
+    missing = (
+        df["Diluted_Shares"].isna()
+        & implied.notna()
+        & (df["Diluted_EPS"].abs() > 0.0001)
+    )
+
+    df.loc[missing, "Diluted_Shares"] = implied[missing]
+    df.loc[missing, "Diluted_Shares_Method"] = (
+        "Implied Net Income / Diluted EPS"
+    )
+
+    # If we inferred shares, recompute the displayed share count.
+    df["Diluted_Shares_M"] = (
+        df["Diluted_Shares"] / 1e6
+    )
+
+    df["Share_Dilution_YoY_%"] = pct_change_safe(
+        df["Diluted_Shares_M"], 4
+    ).clip(-50, 50)
+
+    return df, fact_meta, diagnostics
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if run_button or ticker_symbol:
     try:
         with st.spinner(
-            f"Extracting SEC/XBRL and market data for {ticker_symbol}..."
+            f"Loading SEC XBRL and market data for {ticker_symbol}..."
         ):
             (
-                df_raw_full,
-                df_fcf_full,
-                sec_diag,
-                yf_diag,
-            ) = fetch_and_parse_ticker(ticker_symbol)
+                df_all,
+                fact_meta,
+                diagnostics,
+            ) = fetch_and_parse_ticker(
+                ticker_symbol
+            )
 
             (
                 hist_price,
                 current_price,
                 market_cap,
                 shares_outstanding,
-            ) = fetch_market_and_shares(ticker_symbol)
-
-        df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
-        df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
-
-        if market_cap and current_price:
-            df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
-            df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
-
-            df_raw["P_S_TTM"] = (
-                market_cap / df_raw["TTM_Revenue"]
-            ).where(df_raw["TTM_Revenue"] > 0).clip(lower=0, upper=150)
-
-            df_raw["P_S_Ann"] = (
-                market_cap / df_raw["Ann_Revenue"]
-            ).where(df_raw["Ann_Revenue"] > 0).clip(lower=0, upper=150)
-
-            df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
-            df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
-
-            df_raw["P_E_TTM"] = (
-                current_price / df_raw["TTM_EPS"]
-            ).where(df_raw["TTM_EPS"] > 0).clip(lower=0, upper=200)
-
-            df_raw["P_E_Ann"] = (
-                current_price / df_raw["Ann_EPS"]
-            ).where(df_raw["Ann_EPS"] > 0).clip(lower=0, upper=200)
-
-            merged_fcf = df_raw[["Period"]].merge(
-                df_fcf[["Period", "FCF"]],
-                on="Period",
-                how="left",
+            ) = fetch_market_data(
+                ticker_symbol
             )
 
-            df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
+        df_raw = (
+            df_all
+            .tail(lookback_quarters)
+            .reset_index(drop=True)
+        )
 
-            df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
+        df_fcf = calculate_fcf(df_raw)
+
+        # ----------------------------------------------------
+        # TTM VALUATION
+        # ----------------------------------------------------
+
+        df_raw["TTM_Revenue"] = (
+            df_raw["Revenue"].rolling(4).sum()
+        )
+
+        df_raw["TTM_EPS"] = (
+            df_raw["Diluted_EPS"].rolling(4).sum()
+        )
+
+        df_fcf["TTM_FCF"] = (
+            df_fcf["FCF"].rolling(4).sum()
+        )
+
+        if (
+            pd.notna(market_cap)
+            and market_cap > 0
+            and pd.notna(current_price)
+            and current_price > 0
+        ):
+            df_raw["P_S_TTM"] = safe_divide(
+                market_cap,
+                df_raw["TTM_Revenue"],
+            ).clip(lower=0, upper=150)
+
+            df_raw["P_E_TTM"] = safe_divide(
+                current_price,
+                df_raw["TTM_EPS"],
+            ).where(
+                df_raw["TTM_EPS"] > 0
+            ).clip(lower=0, upper=250)
+
+            df_raw["TTM_FCF"] = (
+                df_fcf["TTM_FCF"].values
+            )
+
+            df_raw["FCF_Yield_%"] = (
+                df_raw["TTM_FCF"]
+                / market_cap
+                * 100
+            )
+
+        # ----------------------------------------------------
+        # HEADER
+        # ----------------------------------------------------
 
         st.subheader(
             f"{ticker_symbol} — Executive Financial Dashboard"
@@ -800,49 +1174,157 @@ if run_button or ticker_symbol:
         with c1:
             st.metric(
                 "Current Price",
-                f"${current_price:,.2f}" if current_price else "N/A",
+                (
+                    f"${current_price:,.2f}"
+                    if pd.notna(current_price)
+                    else "N/A"
+                ),
             )
 
         with c2:
             st.metric(
                 "Market Cap",
-                f"${market_cap/1e9:,.2f}B" if market_cap else "N/A",
+                (
+                    f"${market_cap / 1e9:,.2f}B"
+                    if pd.notna(market_cap)
+                    else "N/A"
+                ),
             )
 
         with c3:
             st.metric(
-                "Quarterly Records",
-                f"{len(df_raw_full)}",
+                "SEC / XBRL Quarters",
+                str(
+                    df_all["Source"]
+                    .astype(str)
+                    .str.contains("SEC")
+                    .sum()
+                ),
             )
 
         with c4:
-            source_counts = df_raw_full["Source"].value_counts()
             st.metric(
-                "SEC Records",
-                f"{source_counts.get('SEC XBRL', 0) + source_counts.get('SEC + Yahoo', 0)}",
+                "Quarterly Records",
+                str(len(df_all)),
             )
 
-        with st.expander("Data Source Diagnostics"):
-            st.write("**Sources used:**")
+        # ----------------------------------------------------
+        # DIAGNOSTICS
+        # ----------------------------------------------------
+
+        with st.expander(
+            "Data Source Diagnostics",
+            expanded=False,
+        ):
+            st.write("**Quarterly source by period:**")
+
+            diag_cols = [
+                "Period",
+                "Source",
+            ]
+
+            for col in [
+                "Revenue_Concept",
+                "Revenue_Method",
+                "Diluted_EPS_Concept",
+                "Diluted_EPS_Method",
+                "Diluted_Shares_Concept",
+                "Diluted_Shares_Method",
+                "OCF_Concept",
+                "OCF_Method",
+                "Capex_Concept",
+                "Capex_Method",
+            ]:
+                if col in df_all.columns:
+                    diag_cols.append(col)
+
             st.dataframe(
-                df_raw_full[
-                    ["Period", "Form", "Source"]
-                ].tail(20),
+                df_all[diag_cols]
+                .tail(20),
                 use_container_width=True,
             )
 
-            if sec_diag:
-                st.write("**SEC diagnostics (most recent):**")
-                for msg in sec_diag[-10:]:
-                    st.caption(msg)
+            if fact_meta:
+                st.write("**XBRL concepts selected:**")
 
-            if yf_diag:
-                st.write("**Yahoo diagnostics:**")
-                for msg in yf_diag[-10:]:
-                    st.caption(msg)
+                concept_rows = []
+
+                for field, meta in fact_meta.items():
+                    if meta:
+                        concept_rows.append(
+                            {
+                                "Metric": field,
+                                "Taxonomy": meta["taxonomy"],
+                                "Concept": meta["concept"],
+                                "Unit": meta["unit"],
+                            }
+                        )
+
+                if concept_rows:
+                    st.dataframe(
+                        pd.DataFrame(concept_rows),
+                        use_container_width=True,
+                    )
+
+            if diagnostics:
+                st.write("**Diagnostics:**")
+                for message in diagnostics[-20:]:
+                    st.caption(message)
+
+        # ----------------------------------------------------
+        # RAW TABLE
+        # ----------------------------------------------------
+
+        with st.expander(
+            "Quarterly Financial Dataset",
+            expanded=False,
+        ):
+            display = df_raw.copy()
+            display["Period"] = display[
+                "Period"
+            ].dt.strftime("%Y-%m-%d")
+
+            display_cols = [
+                "Period",
+                "Source",
+                "Revenue_B",
+                "Rev_YoY_%",
+                "Diluted_EPS",
+                "EPS_YoY_%",
+                "Operating_Income",
+                "Op_Margin_%",
+                "Net_Income",
+                "Net_Margin_%",
+                "OCF",
+                "Capex",
+                "Diluted_Shares_M",
+                "Share_Dilution_YoY_%",
+            ]
+
+            display_cols = [
+                c for c in display_cols
+                if c in display.columns
+            ]
+
+            st.dataframe(
+                display[display_cols],
+                use_container_width=True,
+            )
+
+        # ----------------------------------------------------
+        # CHART 1: FINANCIALS
+        # ----------------------------------------------------
+
+        st.markdown("---")
+        st.subheader(
+            f"{ticker_symbol} — Financial Performance"
+        )
 
         fig, axes = plt.subplots(
-            2, 2, figsize=(16, 11), dpi=150
+            2,
+            2,
+            figsize=(16, 11),
+            dpi=150,
         )
 
         fig.suptitle(
@@ -852,191 +1334,198 @@ if run_button or ticker_symbol:
             y=0.98,
         )
 
-        # Revenue
-        ax1 = axes[0, 0]
-        v_rev = df_raw.dropna(subset=["Revenue_B"])
+        xlabels = df_raw["Period"].dt.strftime(
+            "%Y-%m-%d"
+        )
 
-        if not v_rev.empty:
-            ax1.bar(
-                v_rev["Period"].astype(str),
-                v_rev["Revenue_B"],
-                alpha=0.85,
+        # Revenue
+        ax = axes[0, 0]
+        valid = df_raw["Revenue_B"].notna()
+
+        if valid.any():
+            ax.bar(
+                xlabels[valid],
+                df_raw.loc[valid, "Revenue_B"],
                 width=0.55,
+                alpha=0.85,
                 label="Revenue ($B)",
             )
 
-            ax1.set_title(
+            ax.set_title(
                 "Revenue ($B) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax1.set_ylabel("Revenue ($ Billions)")
-            ax1.tick_params(
+            ax.set_ylabel("Revenue ($B)")
+            ax.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax1_sub = ax1.twinx()
+            ax2 = ax.twinx()
 
-            ax1_sub.plot(
-                v_rev["Period"].astype(str),
-                v_rev["Rev_YoY_%"],
+            ax2.plot(
+                xlabels[valid],
+                df_raw.loc[valid, "Rev_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax1_sub.plot(
-                v_rev["Period"].astype(str),
-                v_rev["Rev_QoQ_%"],
+            ax2.plot(
+                xlabels[valid],
+                df_raw.loc[valid, "Rev_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax1_sub.set_ylabel("Growth (%)")
-            ax1_sub.grid(False)
+            ax2.set_ylabel("Growth (%)")
+            ax2.grid(False)
 
-            l1, lb1 = ax1.get_legend_handles_labels()
-            l1s, lb1s = ax1_sub.get_legend_handles_labels()
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
 
-            ax1.legend(
-                l1 + l1s,
-                lb1 + lb1s,
+            ax.legend(
+                h1 + h2,
+                l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
         # EPS
-        ax2 = axes[0, 1]
-        v_eps = df_raw.dropna(subset=["Diluted_EPS"])
+        ax = axes[0, 1]
+        valid = df_raw["Diluted_EPS"].notna()
 
-        if not v_eps.empty:
-            ax2.bar(
-                v_eps["Period"].astype(str),
-                v_eps["Diluted_EPS"],
-                alpha=0.85,
+        if valid.any():
+            ax.bar(
+                xlabels[valid],
+                df_raw.loc[valid, "Diluted_EPS"],
                 width=0.55,
+                alpha=0.85,
                 label="Diluted EPS ($)",
             )
 
-            ax2.set_title(
+            ax.set_title(
                 "Diluted EPS ($) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax2.set_ylabel("EPS ($)")
-            ax2.tick_params(
+            ax.set_ylabel("EPS ($)")
+            ax.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax2_sub = ax2.twinx()
+            ax2 = ax.twinx()
 
-            ax2_sub.plot(
-                v_eps["Period"].astype(str),
-                v_eps["EPS_YoY_%"],
+            ax2.plot(
+                xlabels[valid],
+                df_raw.loc[valid, "EPS_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax2_sub.plot(
-                v_eps["Period"].astype(str),
-                v_eps["EPS_QoQ_%"],
+            ax2.plot(
+                xlabels[valid],
+                df_raw.loc[valid, "EPS_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax2_sub.set_ylabel("Growth (%)")
-            ax2_sub.grid(False)
+            ax2.set_ylabel("Growth (%)")
+            ax2.grid(False)
 
-            l2, lb2 = ax2.get_legend_handles_labels()
-            l2s, lb2s = ax2_sub.get_legend_handles_labels()
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
 
-            ax2.legend(
-                l2 + l2s,
-                lb2 + lb2s,
+            ax.legend(
+                h1 + h2,
+                l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
         # FCF
-        ax3 = axes[1, 0]
-        v_fcf = df_fcf.tail(lookback_quarters).copy()
-        v_fcf_clean = v_fcf.dropna(subset=["FCF_B"])
+        ax = axes[1, 0]
+        valid = df_fcf["FCF_B"].notna()
 
-        if not v_fcf_clean.empty:
-            ax3.bar(
-                v_fcf_clean["Period"].astype(str),
-                v_fcf_clean["FCF_B"],
-                alpha=0.85,
+        if valid.any():
+            fcf_labels = df_fcf.loc[
+                valid, "Period"
+            ].dt.strftime("%Y-%m-%d")
+
+            ax.bar(
+                fcf_labels,
+                df_fcf.loc[valid, "FCF_B"],
                 width=0.55,
+                alpha=0.85,
                 label="Free Cash Flow ($B)",
             )
 
-            ax3.set_title(
-                "Standalone Free Cash Flow ($B) & Growth",
+            ax.set_title(
+                "Standalone Quarterly Free Cash Flow ($B) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax3.set_ylabel("FCF ($ Billions)")
-            ax3.tick_params(
+            ax.set_ylabel("FCF ($B)")
+            ax.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax3_sub = ax3.twinx()
+            ax2 = ax.twinx()
 
-            ax3_sub.plot(
-                v_fcf_clean["Period"].astype(str),
-                v_fcf_clean["FCF_YoY_%"],
+            ax2.plot(
+                fcf_labels,
+                df_fcf.loc[valid, "FCF_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax3_sub.plot(
-                v_fcf_clean["Period"].astype(str),
-                v_fcf_clean["FCF_QoQ_%"],
+            ax2.plot(
+                fcf_labels,
+                df_fcf.loc[valid, "FCF_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax3_sub.set_ylabel("Growth (%)")
-            ax3_sub.grid(False)
+            ax2.set_ylabel("Growth (%)")
+            ax2.grid(False)
 
-            l3, lb3 = ax3.get_legend_handles_labels()
-            l3s, lb3s = ax3_sub.get_legend_handles_labels()
+            h1, l1 = ax.get_legend_handles_labels()
+            h2, l2 = ax2.get_legend_handles_labels()
 
-            ax3.legend(
-                l3 + l3s,
-                lb3 + lb3s,
+            ax.legend(
+                h1 + h2,
+                l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
         # Margins
-        ax4 = axes[1, 1]
+        ax = axes[1, 1]
 
-        ax4.plot(
-            df_raw["Period"].astype(str),
+        ax.plot(
+            xlabels,
             df_raw["Op_Margin_%"],
             marker="o",
             linewidth=2,
             label="Operating Margin (%)",
         )
 
-        ax4.plot(
-            df_raw["Period"].astype(str),
+        ax.plot(
+            xlabels,
             df_raw["Net_Margin_%"],
             marker="s",
             linestyle="--",
@@ -1044,29 +1533,29 @@ if run_button or ticker_symbol:
             label="Net Margin (%)",
         )
 
-        ax4.axhline(
+        ax.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax4.set_title(
+        ax.set_title(
             "Operating Margin vs. Net Margin (%)",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax4.set_ylabel("Margin (%)")
-        ax4.tick_params(
+        ax.set_ylabel("Margin (%)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax4.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax4.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
@@ -1075,205 +1564,186 @@ if run_button or ticker_symbol:
         plt.tight_layout(
             rect=[0, 0, 1, 0.98]
         )
+
         st.pyplot(fig)
         plt.close(fig)
 
-        # -------------------------------------------------------------------
-        # VALUATION
-        # -------------------------------------------------------------------
+        # ----------------------------------------------------
+        # CHART 2: VALUATION / PRICE
+        # ----------------------------------------------------
 
         st.markdown("---")
         st.subheader(
-            f"{ticker_symbol} — Valuation Multiples & Price Action"
+            f"{ticker_symbol} — Valuation & Price Action"
         )
 
         fig2, axes2 = plt.subplots(
-            2, 2, figsize=(16, 11), dpi=150
+            2,
+            2,
+            figsize=(16, 11),
+            dpi=150,
         )
 
         fig2.suptitle(
-            f"{ticker_symbol} Price Action, TTM/Annualized Multiples & FCF Yield",
+            f"{ticker_symbol} Price Action & Valuation",
             fontsize=15,
             fontweight="bold",
             y=0.98,
         )
 
-        # Price / EMA
-        ax_p1 = axes2[0, 0]
+        # Price
+        ax = axes2[0, 0]
 
-        if hist_price is not None and not hist_price.empty:
-            ax_p1.plot(
+        if (
+            hist_price is not None
+            and not hist_price.empty
+        ):
+            ax.plot(
                 hist_price.index,
                 hist_price["Close"],
                 linewidth=1.5,
                 label="Close Price ($)",
             )
 
-            if "EMA50" in hist_price.columns:
-                ax_p1.plot(
-                    hist_price.index,
-                    hist_price["EMA50"],
-                    linestyle="-",
-                    linewidth=1.2,
-                    label="50-Day EMA",
-                )
+            ax.plot(
+                hist_price.index,
+                hist_price["EMA50"],
+                linewidth=1.2,
+                label="50-Day EMA",
+            )
 
-            if "EMA200" in hist_price.columns:
-                ax_p1.plot(
-                    hist_price.index,
-                    hist_price["EMA200"],
-                    linestyle="--",
-                    linewidth=1.2,
-                    label="200-Day EMA",
-                )
+            ax.plot(
+                hist_price.index,
+                hist_price["EMA200"],
+                linestyle="--",
+                linewidth=1.2,
+                label="200-Day EMA",
+            )
 
-        ax_p1.set_title(
+        ax.set_title(
             "Daily Stock Price vs 50/200 EMA",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_p1.set_ylabel("Price ($)")
-        ax_p1.tick_params(
-            axis="x",
-            rotation=45,
-            labelsize=7,
-        )
-        ax_p1.legend(
+        ax.set_ylabel("Price ($)")
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_p1.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
         # P/S
-        ax_p2 = axes2[0, 1]
+        ax = axes2[0, 1]
 
         if "P_S_TTM" in df_raw.columns:
-            ax_p2.plot(
-                df_raw["Period"].astype(str),
+            ax.plot(
+                xlabels,
                 df_raw["P_S_TTM"],
                 marker="o",
                 linewidth=2,
                 label="P/S (TTM)",
             )
 
-            ax_p2.plot(
-                df_raw["Period"].astype(str),
-                df_raw["P_S_Ann"],
-                marker="^",
-                linestyle="--",
-                linewidth=1.5,
-                label="P/S (Annualized Quarter)",
-            )
-
-        ax_p2.set_title(
-            "Price-to-Sales (P/S): TTM vs Annualized Q",
+        ax.set_title(
+            "Price-to-Sales (P/S) — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_p2.set_ylabel("P/S Multiple (x)")
-        ax_p2.tick_params(
+        ax.set_ylabel("P/S Multiple (x)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax_p2.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_p2.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
         # P/E
-        ax_p3 = axes2[1, 0]
+        ax = axes2[1, 0]
 
         if "P_E_TTM" in df_raw.columns:
-            ax_p3.plot(
-                df_raw["Period"].astype(str),
+            ax.plot(
+                xlabels,
                 df_raw["P_E_TTM"],
                 marker="s",
                 linewidth=2,
                 label="P/E (TTM)",
             )
 
-            ax_p3.plot(
-                df_raw["Period"].astype(str),
-                df_raw["P_E_Ann"],
-                marker="d",
-                linestyle="--",
-                linewidth=1.5,
-                label="P/E (Annualized Quarter)",
-            )
-
-        ax_p3.axhline(
+        ax.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax_p3.set_title(
-            "Price-to-Earnings (P/E): TTM vs Annualized Q",
+        ax.set_title(
+            "Price-to-Earnings (P/E) — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_p3.set_ylabel("P/E Multiple (x)")
-        ax_p3.tick_params(
+        ax.set_ylabel("P/E Multiple (x)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax_p3.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_p3.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        # FCF Yield
-        ax_p4 = axes2[1, 1]
+        # FCF yield
+        ax = axes2[1, 1]
 
         if "FCF_Yield_%" in df_raw.columns:
-            ax_p4.plot(
-                df_raw["Period"].astype(str),
+            ax.plot(
+                xlabels,
                 df_raw["FCF_Yield_%"],
                 marker="^",
                 linewidth=2,
                 label="FCF Yield (TTM %)",
             )
 
-        ax_p4.axhline(
+        ax.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax_p4.set_title(
-            "Free Cash Flow Yield (TTM %)",
+        ax.set_title(
+            "Free Cash Flow Yield — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_p4.set_ylabel("FCF Yield (%)")
-        ax_p4.tick_params(
+        ax.set_ylabel("FCF Yield (%)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax_p4.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_p4.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
@@ -1282,109 +1752,99 @@ if run_button or ticker_symbol:
         plt.tight_layout(
             rect=[0, 0, 1, 0.98]
         )
+
         st.pyplot(fig2)
         plt.close(fig2)
 
-        # -------------------------------------------------------------------
-        # CAPEX / DILUTION
-        # -------------------------------------------------------------------
+        # ----------------------------------------------------
+        # CHART 3: CAPEX / SHARES
+        # ----------------------------------------------------
 
         st.markdown("---")
         st.subheader(
-            f"{ticker_symbol} — Capital Expenditures & Share Dilution"
+            f"{ticker_symbol} — Capex & Share Count"
         )
 
         fig3, axes3 = plt.subplots(
-            1, 2, figsize=(16, 5), dpi=150
+            1,
+            2,
+            figsize=(16, 5),
+            dpi=150,
         )
 
-        ax_c1 = axes3[0]
+        ax = axes3[0]
 
-        ax_c1.bar(
-            df_raw["Period"].astype(str),
-            df_raw["Capex_B"],
-            alpha=0.85,
+        ax.bar(
+            xlabels,
+            df_raw["Capex"].abs() / 1e9,
             width=0.55,
+            alpha=0.85,
             label="Capex ($B)",
         )
 
-        ax_c1.set_title(
+        ax.set_title(
             "Quarterly Capital Expenditures ($B)",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_c1.set_ylabel("Capex ($ Billions)")
-        ax_c1.tick_params(
+        ax.set_ylabel("Capex ($B)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax_c1.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_c1.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        ax_c2 = axes3[1]
+        ax = axes3[1]
 
-        ax_c2.plot(
-            df_raw["Period"].astype(str),
+        ax.plot(
+            xlabels,
             df_raw["Share_Dilution_YoY_%"],
             marker="o",
             linewidth=2,
             label="Diluted Share Growth YoY (%)",
         )
 
-        ax_c2.axhline(
+        ax.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax_c2.set_title(
-            "Share Dilution / Buyback Rate (YoY % Change)",
+        ax.set_title(
+            "Diluted Share Count Change — YoY %",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax_c2.set_ylabel("Share Count YoY Change (%)")
-        ax_c2.tick_params(
+        ax.set_ylabel("Share Count YoY Change (%)")
+        ax.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax_c2.legend(
+        ax.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax_c2.grid(
+        ax.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
         plt.tight_layout()
+
         st.pyplot(fig3)
         plt.close(fig3)
-
-        # -------------------------------------------------------------------
-        # RAW DATA
-        # -------------------------------------------------------------------
-
-        with st.expander(
-            "View Raw Extracted Dataset & Valuations"
-        ):
-            display_df = df_raw.copy()
-            display_df["Period"] = display_df["Period"].dt.strftime("%Y-%m-%d")
-
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-            )
 
     except Exception as exc:
         st.error(
