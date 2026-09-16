@@ -18,9 +18,6 @@ warnings.filterwarnings("ignore")
 # CONFIG
 # ---------------------------------------------------------------------------
 
-# Prefer setting EDGAR_IDENTITY as a Streamlit secret/environment variable.
-# Example:
-# EDGAR_IDENTITY = "Scott Davis your@email.com"
 EDGAR_IDENTITY = os.getenv(
     "EDGAR_IDENTITY",
     st.secrets.get("EDGAR_IDENTITY", "Scott Davis scott@example.com"),
@@ -77,6 +74,7 @@ with st.sidebar:
 # HELPERS
 # ---------------------------------------------------------------------------
 
+
 def clean_number(value):
     """Convert common SEC/Yahoo numeric representations to float."""
     if value is None:
@@ -90,7 +88,13 @@ def clean_number(value):
         return np.nan
 
     negative = s.startswith("(") and s.endswith(")")
-    s = s.replace("$", "").replace(",", "").replace("%", "").replace("(", "").replace(")", "")
+    s = (
+        s.replace("$", "")
+        .replace(",", "")
+        .replace("%", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
 
     try:
         x = float(s)
@@ -121,9 +125,6 @@ def safe_divide(a, b):
 # XBRL / SEC EXTRACTION
 # ---------------------------------------------------------------------------
 
-# These are deliberately prioritized rather than using a broad "first label
-# containing Revenue" search. This avoids accidentally selecting a subtotal,
-# segment, or comparative-period row.
 CONCEPT_CANDIDATES = {
     "Revenue": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
@@ -163,26 +164,18 @@ CONCEPT_CANDIDATES = {
 
 
 def find_statement_value(statement_df, candidates):
-    """
-    Find a statement value using standardized XBRL concept/label information.
-
-    This function deliberately does NOT take the first column containing a year.
-    Instead, it examines the dataframe for period columns and chooses the most
-    recent standalone-looking period available in the statement.
-    """
+    """Find a statement value using standardized XBRL concept/label information."""
     if statement_df is None or statement_df.empty:
         return np.nan
 
     df = statement_df.copy()
 
-    # Locate a concept/label column.
     concept_col = None
     for c in ["standard_concept", "concept", "label", "name"]:
         if c in df.columns:
             concept_col = c
             break
 
-    # Some EdgarTools statement DataFrames use the index for labels/concepts.
     if concept_col is None:
         working = df.copy()
         working["_row_text"] = working.index.astype(str)
@@ -190,7 +183,6 @@ def find_statement_value(statement_df, candidates):
         working = df.copy()
         working["_row_text"] = working[concept_col].astype(str)
 
-    # Score rows by exact concept first, then normalized label.
     for candidate in candidates:
         candidate_norm = normalize_label(candidate)
 
@@ -203,7 +195,6 @@ def find_statement_value(statement_df, candidates):
             if is_reasonable_numeric(value):
                 return value
 
-    # Conservative fallback: only use a label match if it is unambiguous.
     candidate_words = [normalize_label(x) for x in candidates]
     mask = working["_row_text"].map(
         lambda x: any(cw in normalize_label(x) for cw in candidate_words)
@@ -217,13 +208,7 @@ def find_statement_value(statement_df, candidates):
 
 
 def _latest_numeric_period_value(row):
-    """
-    Select a numeric value from a statement row.
-
-    Period columns are identified from their names and then ordered so that
-    current/recent period columns are preferred. We avoid assuming that the
-    first year-looking column is the desired quarter.
-    """
+    """Select a numeric value from a statement row."""
     candidates = []
 
     for col in row.index:
@@ -235,11 +220,12 @@ def _latest_numeric_period_value(row):
             continue
 
         text = str(col)
-        # Ignore obvious metadata columns.
-        if any(x in text.lower() for x in ["label", "concept", "standard_concept", "units"]):
+        if any(
+            x in text.lower()
+            for x in ["label", "concept", "standard_concept", "units"]
+        ):
             continue
 
-        # Score period-like columns. Current/recent columns get higher scores.
         score = 0
         upper = text.upper()
 
@@ -250,8 +236,6 @@ def _latest_numeric_period_value(row):
         if "202" in upper:
             score += 2
 
-        # Prefer columns that appear toward the right/current end of the
-        # statement when scores are otherwise similar.
         candidates.append((score, text, value))
 
     if not candidates:
@@ -270,27 +254,13 @@ def _period_from_filing(filing):
 
 
 def _extract_from_edgar_statements(ticker):
-    """
-    Primary SEC path.
-
-    Uses recent 10-Q/10-K/20-F filings and EdgarTools' parsed XBRL statements.
-    It intentionally keeps only one observation per report date and uses the
-    filing period date as the normalized quarter/year endpoint.
-    """
+    """Primary SEC path."""
     records = []
     diagnostics = []
 
     try:
         company = Company(ticker)
-
-        # Get both domestic and foreign annual/quarterly reporting forms.
-        # Foreign private issuers such as MELI/NU often use 20-F/6-K rather
-        # than 10-Q, so the 10-Q-only approach is intentionally avoided.
-        filings = company.get_filings(
-            form=["10-Q", "10-K", "20-F"]
-        )
-
-        # Keep a reasonable number of recent filings. Sorting is handled below.
+        filings = company.get_filings(form=["10-Q", "10-K", "20-F"])
         filings = list(filings)[:60]
 
         for filing in filings:
@@ -312,9 +282,7 @@ def _extract_from_edgar_statements(ticker):
                     else None
                 )
                 cf_df = (
-                    cf.to_dataframe(view="standard")
-                    if cf is not None
-                    else None
+                    cf.to_dataframe(view="standard") if cf is not None else None
                 )
 
                 if inc_df is None or inc_df.empty:
@@ -347,26 +315,26 @@ def _extract_from_edgar_statements(ticker):
                     ),
                 }
 
-                # Require at least revenue or net income to count a filing.
                 if is_reasonable_numeric(record["Revenue"]) or is_reasonable_numeric(
                     record["Net_Income"]
                 ):
                     records.append(record)
 
             except Exception as exc:
-                diagnostics.append(f"{period.date()} {form}: {type(exc).__name__}: {exc}")
+                diagnostics.append(
+                    f"{period.date()} {form}: {type(exc).__name__}: {exc}"
+                )
                 continue
 
     except Exception as exc:
-        diagnostics.append(f"SEC company/fillings error: {type(exc).__name__}: {exc}")
+        diagnostics.append(
+            f"SEC company/fillings error: {type(exc).__name__}: {exc}"
+        )
 
     if not records:
         return pd.DataFrame(), diagnostics
 
     df = pd.DataFrame(records)
-
-    # Multiple filings can contain the same report date. Prefer 10-Q for
-    # quarterly dates, otherwise retain the first complete observation.
     df["completeness"] = df.notna().sum(axis=1)
 
     df = (
@@ -437,12 +405,7 @@ def yahoo_row_value(df, keys, date_col):
 
 
 def fetch_yahoo_quarterly(ticker):
-    """
-    Yahoo fallback.
-
-    Yahoo financial statements are already presented as quarterly columns, so
-    we do not attempt the old SEC-style YTD subtraction here.
-    """
+    """Yahoo fallback."""
     diagnostics = []
 
     try:
@@ -481,12 +444,8 @@ def fetch_yahoo_quarterly(ticker):
                     "Diluted_Shares": yahoo_row_value(
                         inc, YF_KEYS["Diluted_Shares"], date_col
                     ),
-                    "OCF": yahoo_row_value(
-                        cf, YF_KEYS["OCF"], date_col
-                    ),
-                    "Capex": yahoo_row_value(
-                        cf, YF_KEYS["Capex"], date_col
-                    ),
+                    "OCF": yahoo_row_value(cf, YF_KEYS["OCF"], date_col),
+                    "Capex": yahoo_row_value(cf, YF_KEYS["Capex"], date_col),
                 }
             )
 
@@ -498,11 +457,7 @@ def fetch_yahoo_quarterly(ticker):
 
 
 def merge_sec_and_yahoo(sec_df, yf_df):
-    """
-    SEC is authoritative where a value exists. Yahoo fills missing fields or
-    missing periods. This is much safer than replacing the whole SEC dataset
-    with Yahoo when one SEC field is missing.
-    """
+    """SEC is authoritative where a value exists. Yahoo fills missing fields."""
     if sec_df.empty:
         return yf_df.copy()
 
@@ -535,14 +490,11 @@ def merge_sec_and_yahoo(sec_df, yf_df):
         ignore_index=True,
     )
 
-    # Group by reporting date. SEC rows are placed first.
     combined["source_priority"] = np.where(
         combined["Source"].eq("SEC XBRL"), 0, 1
     )
 
-    combined = combined.sort_values(
-        ["Period", "source_priority"]
-    )
+    combined = combined.sort_values(["Period", "source_priority"])
 
     output = []
 
@@ -565,7 +517,6 @@ def merge_sec_and_yahoo(sec_df, yf_df):
             values = pd.to_numeric(group[col], errors="coerce").dropna()
             row[col] = values.iloc[0] if not values.empty else np.nan
 
-        # If Yahoo supplied a missing SEC value, identify the source as mixed.
         if len(group) > 1:
             sec_row = group[group["Source"].eq("SEC XBRL")]
             yf_row = group[group["Source"].eq("Yahoo Finance")]
@@ -600,15 +551,9 @@ def merge_sec_and_yahoo(sec_df, yf_df):
 # CASH FLOW NORMALIZATION
 # ---------------------------------------------------------------------------
 
-def calculate_fcf_safe(df):
-    """
-    Calculate standalone FCF.
 
-    Important: Yahoo's quarterly cash flow values are already quarterly.
-    SEC statement output may contain a mixture of quarterly and YTD periods.
-    This function uses a conservative approach: when the extracted cash flow
-    appears to be cumulative, subtract the prior same-fiscal-year observation.
-    """
+def calculate_fcf_safe(df):
+    """Calculate standalone FCF."""
     if df.empty:
         return pd.DataFrame(columns=["Period", "FCF", "FCF_B"])
 
@@ -618,46 +563,48 @@ def calculate_fcf_safe(df):
     work["Capex"] = pd.to_numeric(work["Capex"], errors="coerce")
     work = work.sort_values("Period").reset_index(drop=True)
 
-    # Because mixed SEC/Yahoo data may contain both quarterly and cumulative
-    # values, only subtract when a current value is larger in magnitude than
-    # the previous same-calendar-year value. This is intentionally conservative.
     standalone_ocf = []
     standalone_capex = []
 
-    previous_year = None
-    previous_ocf = np.nan
-    previous_capex = np.nan
+    prev_year = None
+    prev_ocf_ytd = np.nan
+    prev_capex_ytd = np.nan
 
     for _, row in work.iterrows():
-        period = row["Period"]
-        year = period.year if pd.notna(period) else None
+        p_date = row["Period"]
+        curr_year = p_date.year if pd.notna(p_date) else None
+        month = p_date.month if pd.notna(p_date) else 3
 
         ocf = row["OCF"]
         capex = row["Capex"]
 
-        q_ocf = ocf
-        q_capex = capex
-
-        if year == previous_year:
-            if pd.notna(ocf) and pd.notna(previous_ocf):
-                # If the new value is clearly cumulative, derive the quarter.
-                if abs(ocf) >= abs(previous_ocf) * 1.10:
-                    q_ocf = ocf - previous_ocf
-
-            if pd.notna(capex) and pd.notna(previous_capex):
-                if abs(capex) >= abs(previous_capex) * 1.10:
-                    q_capex = capex - previous_capex
+        if curr_year != prev_year or month <= 4:
+            q_ocf = ocf
+            q_capex = capex
+        else:
+            q_ocf = ocf - prev_ocf_ytd if pd.notna(prev_ocf_ytd) else ocf
+            q_capex = capex - prev_capex_ytd if pd.notna(prev_capex_ytd) else capex
 
         standalone_ocf.append(q_ocf)
         standalone_capex.append(q_capex)
 
-        previous_year = year
-        previous_ocf = ocf
-        previous_capex = capex
+        prev_year = curr_year
+        prev_ocf_ytd = ocf
+        prev_capex_ytd = capex
 
-    fcf = np.array(standalone_ocf, dtype=float) - np.abs(
-        np.array(standalone_capex, dtype=float)
-    )
+    # Convert pandas NA/None/strings safely before NumPy arithmetic.
+    # np.array([...], dtype=float) raises TypeError when a list contains pd.NA.
+    ocf_series = pd.to_numeric(
+        pd.Series(standalone_ocf, index=work.index),
+        errors="coerce",
+    ).astype(float)
+
+    capex_series = pd.to_numeric(
+        pd.Series(standalone_capex, index=work.index),
+        errors="coerce",
+    ).astype(float)
+
+    fcf = ocf_series.to_numpy() - np.abs(capex_series.to_numpy())
 
     out = pd.DataFrame(
         {
@@ -677,6 +624,7 @@ def calculate_fcf_safe(df):
 # MAIN DATA FETCH
 # ---------------------------------------------------------------------------
 
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_and_parse_ticker(ticker):
     sec_df, sec_diag = _extract_from_edgar_statements(ticker)
@@ -690,7 +638,6 @@ def fetch_and_parse_ticker(ticker):
             f"SEC diagnostics: {sec_diag[-2:]}; Yahoo diagnostics: {yf_diag[-2:]}"
         )
 
-    # Ensure all numeric fields are numeric.
     numeric_cols = [
         "Revenue",
         "Operating_Income",
@@ -710,14 +657,10 @@ def fetch_and_parse_ticker(ticker):
         .reset_index(drop=True)
     )
 
-    # The old code inferred shares from net income / EPS. Keep that only as a
-    # last-resort fallback because it can be distorted by rounding or unusual
-    # share-class accounting.
     implied_shares = safe_divide(df["Net_Income"], df["Diluted_EPS"])
     missing_shares = df["Diluted_Shares"].isna()
     df.loc[missing_shares, "Diluted_Shares"] = implied_shares[missing_shares]
 
-    # Core derived metrics.
     df["Revenue_B"] = df["Revenue"] / 1e9
     df["Rev_YoY_%"] = pct_change_safe(df["Revenue_B"], 4)
     df["Rev_QoQ_%"] = pct_change_safe(df["Revenue_B"], 1)
@@ -725,20 +668,16 @@ def fetch_and_parse_ticker(ticker):
     df["EPS_YoY_%"] = pct_change_safe(df["Diluted_EPS"], 4).clip(-200, 200)
     df["EPS_QoQ_%"] = pct_change_safe(df["Diluted_EPS"], 1).clip(-200, 200)
 
-    df["Op_Margin_%"] = safe_divide(
-        df["Operating_Income"], df["Revenue"]
-    ) * 100
+    df["Op_Margin_%"] = safe_divide(df["Operating_Income"], df["Revenue"]) * 100
 
-    df["Net_Margin_%"] = safe_divide(
-        df["Net_Income"], df["Revenue"]
-    ) * 100
+    df["Net_Margin_%"] = safe_divide(df["Net_Income"], df["Revenue"]) * 100
 
     df["Capex_B"] = np.abs(df["Capex"]) / 1e9
     df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
 
-    df["Share_Dilution_YoY_%"] = (
-        pct_change_safe(df["Diluted_Shares_M"], 4).clip(-25, 25)
-    )
+    df["Share_Dilution_YoY_%"] = pct_change_safe(
+        df["Diluted_Shares_M"], 4
+    ).clip(-25, 25)
 
     fcf_df = calculate_fcf_safe(df)
 
@@ -748,6 +687,7 @@ def fetch_and_parse_ticker(ticker):
 # ---------------------------------------------------------------------------
 # MARKET DATA
 # ---------------------------------------------------------------------------
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_market_and_shares(ticker):
@@ -783,11 +723,7 @@ def fetch_market_and_shares(ticker):
 
         shares_outstanding = info.get("sharesOutstanding")
 
-        if (
-            not market_cap
-            and current_price
-            and shares_outstanding
-        ):
+        if not market_cap and current_price and shares_outstanding:
             market_cap = current_price * shares_outstanding
 
         return hist, current_price, market_cap, shares_outstanding
@@ -822,40 +758,28 @@ if run_button or ticker_symbol:
         df_raw = df_raw_full.tail(lookback_quarters).reset_index(drop=True)
         df_fcf = df_fcf_full.tail(lookback_quarters).reset_index(drop=True)
 
-        # -------------------------------------------------------------------
-        # TTM / VALUATION
-        # -------------------------------------------------------------------
-
         if market_cap and current_price:
             df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
             df_raw["Ann_Revenue"] = df_raw["Revenue"] * 4
 
             df_raw["P_S_TTM"] = (
                 market_cap / df_raw["TTM_Revenue"]
-            ).where(
-                df_raw["TTM_Revenue"] > 0
-            ).clip(lower=0, upper=150)
+            ).where(df_raw["TTM_Revenue"] > 0).clip(lower=0, upper=150)
 
             df_raw["P_S_Ann"] = (
                 market_cap / df_raw["Ann_Revenue"]
-            ).where(
-                df_raw["Ann_Revenue"] > 0
-            ).clip(lower=0, upper=150)
+            ).where(df_raw["Ann_Revenue"] > 0).clip(lower=0, upper=150)
 
             df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
             df_raw["Ann_EPS"] = df_raw["Diluted_EPS"] * 4
 
             df_raw["P_E_TTM"] = (
                 current_price / df_raw["TTM_EPS"]
-            ).where(
-                df_raw["TTM_EPS"] > 0
-            ).clip(lower=0, upper=200)
+            ).where(df_raw["TTM_EPS"] > 0).clip(lower=0, upper=200)
 
             df_raw["P_E_Ann"] = (
                 current_price / df_raw["Ann_EPS"]
-            ).where(
-                df_raw["Ann_EPS"] > 0
-            ).clip(lower=0, upper=200)
+            ).where(df_raw["Ann_EPS"] > 0).clip(lower=0, upper=200)
 
             merged_fcf = df_raw[["Period"]].merge(
                 df_fcf[["Period", "FCF"]],
@@ -865,13 +789,7 @@ if run_button or ticker_symbol:
 
             df_raw["TTM_FCF"] = merged_fcf["FCF"].rolling(4).sum()
 
-            df_raw["FCF_Yield_%"] = (
-                df_raw["TTM_FCF"] / market_cap
-            ) * 100
-
-        # -------------------------------------------------------------------
-        # HEADER / DIAGNOSTICS
-        # -------------------------------------------------------------------
+            df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
 
         st.subheader(
             f"{ticker_symbol} — Executive Financial Dashboard"
@@ -882,17 +800,13 @@ if run_button or ticker_symbol:
         with c1:
             st.metric(
                 "Current Price",
-                f"${current_price:,.2f}"
-                if current_price
-                else "N/A",
+                f"${current_price:,.2f}" if current_price else "N/A",
             )
 
         with c2:
             st.metric(
                 "Market Cap",
-                f"${market_cap/1e9:,.2f}B"
-                if market_cap
-                else "N/A",
+                f"${market_cap/1e9:,.2f}B" if market_cap else "N/A",
             )
 
         with c3:
@@ -926,10 +840,6 @@ if run_button or ticker_symbol:
                 st.write("**Yahoo diagnostics:**")
                 for msg in yf_diag[-10:]:
                     st.caption(msg)
-
-        # -------------------------------------------------------------------
-        # FINANCIAL DASHBOARD
-        # -------------------------------------------------------------------
 
         fig, axes = plt.subplots(
             2, 2, figsize=(16, 11), dpi=150
@@ -1481,5 +1391,4 @@ if run_button or ticker_symbol:
             f"Could not load data for ticker '{ticker_symbol}'. "
             f"Error: {type(exc).__name__}: {exc}"
         )
-
         st.exception(exc)
