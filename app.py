@@ -24,8 +24,8 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Terminal")
 st.markdown(
-    "Quarterly financial data from SEC XBRL, with Yahoo Finance used for "
-    "market-price history and as a limited fallback."
+    "Quarterly financial data from SEC XBRL (US-GAAP & IFRS), with Yahoo Finance "
+    "used for market-price history and as a limited fallback."
 )
 
 DEFAULT_IDENTITY = "Scott Davis scott@example.com"
@@ -196,30 +196,32 @@ def get_companyfacts(cik):
 
 
 # ============================================================
-# XBRL FACT DEFINITIONS
+# XBRL FACT DEFINITIONS (US-GAAP + IFRS)
 # ============================================================
 
-# Priority order matters. These are concept names, not loose labels.
-# We search US-GAAP first and IFRS-full second.
 FLOW_CONCEPTS = {
     "Revenue": [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "RevenueFromContractWithCustomerIncludingAssessedTax",
+        "RevenueFromContractsWithCustomers",  # IFRS
         "Revenues",
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
-        "Revenue",
+        "Revenue",  # IFRS generic
     ],
     "Operating_Income": [
         "OperatingIncomeLoss",
+        "ProfitLossFromOperatingActivities",  # IFRS
     ],
     "Net_Income": [
         "NetIncomeLoss",
-        "ProfitLoss",
+        "ProfitLoss",  # IFRS
+        "ProfitLossAttributableToOwners",  # IFRS
     ],
     "Diluted_EPS": [
         "EarningsPerShareDiluted",
         "EarningsPerShareBasicAndDiluted",
+        "DilutedEarningsPerShare",  # IFRS
     ],
     "Diluted_Shares": [
         "WeightedAverageNumberOfDilutedSharesOutstanding",
@@ -228,19 +230,17 @@ FLOW_CONCEPTS = {
     "OCF": [
         "NetCashProvidedByUsedInOperatingActivities",
         "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
-        "CashFlowsFromUsedInOperatingActivities",
+        "CashFlowsFromUsedInOperatingActivities",  # IFRS
     ],
     "Capex": [
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PurchaseOfPropertyPlantAndEquipment",
         "PaymentsForAdditionsToPropertyPlantAndEquipment",
         "PaymentsToAcquirePropertyPlantAndEquipmentAndOtherPropertyPlantAndEquipment",
+        "AdditionsToPropertyPlantAndEquipment",  # IFRS
     ],
 }
 
-# Some foreign filers use IFRS concepts whose exact names differ.
-# The label matching below is deliberately conservative and only used if
-# no preferred concept is available.
 LABEL_FALLBACKS = {
     "Revenue": [
         "revenue",
@@ -287,16 +287,8 @@ FLOW_FIELDS = [
 # ============================================================
 
 def all_fact_candidates(companyfacts, field):
-    """
-    Return preferred XBRL concepts for a requested metric.
-
-    Company Facts are organized by taxonomy -> concept -> units.
-    """
     facts = companyfacts.get("facts", {})
-
     preferred = FLOW_CONCEPTS.get(field, [])
-
-    # Search all taxonomies, preserving preferred concept order.
     candidates = []
 
     for taxonomy, taxonomy_facts in facts.items():
@@ -343,7 +335,6 @@ def choose_unit_name(concept_data, field):
             if unit in units:
                 return unit
 
-        # If there is only one monetary unit, use it.
         if len(units) == 1:
             return next(iter(units.keys()))
 
@@ -354,11 +345,6 @@ def choose_unit_name(concept_data, field):
 
 
 def get_preferred_entries(companyfacts, field):
-    """
-    Retrieve all entries for the first useful XBRL concept.
-
-    We do not mix concepts unless the preferred concept has no usable data.
-    """
     candidates = all_fact_candidates(companyfacts, field)
 
     for taxonomy, concept, concept_data in candidates:
@@ -403,16 +389,6 @@ def entry_is_flow(entry):
 
 
 def quarter_from_frame(frame):
-    """
-    SEC 'frame' values are the cleanest way to identify standalone calendar
-    quarters for flow facts.
-
-    Examples:
-      CY2025Q1
-      CY2025Q2
-      CY2025Q3
-      CY2025Q4
-    """
     if not frame:
         return None
 
@@ -428,16 +404,6 @@ def quarter_from_frame(frame):
 
 
 def standalone_quarter_candidates(entries):
-    """
-    Select entries that look like standalone quarters.
-
-    Preference:
-      1. SEC frame CYyyyyQn
-      2. duration of roughly one quarter
-      3. 10-Q/20-F quarterly filings
-
-    We explicitly reject 6-, 9-, and 12-month cumulative periods here.
-    """
     output = []
 
     for e in entries:
@@ -454,9 +420,6 @@ def standalone_quarter_candidates(entries):
         q_end = quarter_from_frame(frame)
 
         if q_end is not None:
-            # Frames are a strong indicator of a standalone calendar quarter.
-            # A Q4 annual frame can also occur, but annual filings are handled
-            # separately below.
             output.append(
                 {
                     "entry": e,
@@ -467,8 +430,6 @@ def standalone_quarter_candidates(entries):
             )
             continue
 
-        # Typical standalone quarter duration:
-        # allow a broad range because 52/53-week fiscal quarters exist.
         if 70 <= days <= 110:
             end = entry_date(e, "end")
             score = 50
@@ -501,7 +462,6 @@ def annual_candidates(entries):
 
         form = str(e.get("form", "")).upper()
 
-        # Annual period. 53-week years are covered.
         if 320 <= days <= 390 and form in {"10-K", "20-F"}:
             output.append(e)
 
@@ -512,7 +472,6 @@ def pick_best_entry(candidates):
     if not candidates:
         return None
 
-    # Prefer the latest filed version, then the latest accession.
     def sort_key(x):
         e = x["entry"] if "entry" in x else x
         filed = str(e.get("filed", ""))
@@ -527,13 +486,6 @@ def pick_best_entry(candidates):
 # ============================================================
 
 def build_quarterly_fact_table(companyfacts):
-    """
-    Build a normalized quarterly dataset directly from SEC Company Facts.
-
-    This is the critical change from the previous version:
-    we never select 'the first column containing 2025' from a statement table.
-    We select individual XBRL facts by their reporting period.
-    """
     fact_meta = {}
     quarter_rows = {}
 
@@ -549,7 +501,6 @@ def build_quarterly_fact_table(companyfacts):
         entries = meta["entries"]
         candidates = standalone_quarter_candidates(entries)
 
-        # Group candidate observations by quarter-end.
         grouped = {}
 
         for item in candidates:
@@ -602,7 +553,6 @@ def build_quarterly_fact_table(companyfacts):
         .reset_index(drop=True)
     )
 
-    # Remove obvious pre-2018 junk from a modern dashboard.
     df = df[df["Period"] >= pd.Timestamp("2017-01-01")].reset_index(drop=True)
 
     return df, fact_meta
@@ -721,13 +671,6 @@ def fetch_yahoo_quarterly(ticker):
 
 
 def merge_sec_yahoo(sec_df, yahoo_df):
-    """
-    SEC wins whenever a SEC value exists.
-
-    Yahoo only fills a missing SEC field or an SEC period that is completely
-    absent. This prevents the old behavior where a weak Yahoo result could
-    overwrite the SEC series.
-    """
     if sec_df.empty:
         return yahoo_df.copy()
 
@@ -798,7 +741,6 @@ def merge_sec_yahoo(sec_df, yahoo_df):
                 else:
                     result[col] = np.nan
 
-            # Preserve SEC concept/method columns where available.
             for c in sec.columns:
                 if c.endswith("_Concept") or c.endswith("_Method"):
                     result[c] = row.get(c, None)
@@ -898,16 +840,6 @@ def calculate_metrics(df):
 
 
 def calculate_fcf(df):
-    """
-    FCF is only calculated from values that are already represented as
-    standalone quarterly cash-flow facts.
-
-    We do NOT perform the old heuristic 'subtract previous YTD if the value
-    is bigger'. That heuristic was one of the sources of bad FCF output.
-
-    If SEC provides a standalone quarterly fact, use it.
-    If Yahoo supplies the quarter, Yahoo's quarterly statement is used.
-    """
     work = df[
         ["Period", "OCF", "Capex", "Source"]
     ].copy()
@@ -920,8 +852,6 @@ def calculate_fcf(df):
         work["Capex"], errors="coerce"
     )
 
-    # Capex is normally reported as a negative cash flow in SEC data.
-    # We want FCF = OCF - positive Capex.
     work["Capex_Positive"] = work["Capex"].abs()
 
     work["FCF"] = (
@@ -1053,8 +983,6 @@ def fetch_and_parse_ticker(ticker):
 
     df = calculate_metrics(df)
 
-    # Last-resort share-count inference only where actual diluted share data
-    # is unavailable. It is explicitly marked in the dataset.
     implied = safe_divide(
         df["Net_Income"],
         df["Diluted_EPS"],
@@ -1071,7 +999,6 @@ def fetch_and_parse_ticker(ticker):
         "Implied Net Income / Diluted EPS"
     )
 
-    # If we inferred shares, recompute the displayed share count.
     df["Diluted_Shares_M"] = (
         df["Diluted_Shares"] / 1e6
     )
@@ -1396,7 +1323,7 @@ if run_button or ticker_symbol:
             )
 
         # EPS
-        ax = axes[0, 1]
+        ax = axes
         valid = df_raw["Diluted_EPS"].notna()
 
         if valid.any():
@@ -1453,7 +1380,7 @@ if run_button or ticker_symbol:
             )
 
         # FCF
-        ax = axes[1, 0]
+        ax = axes
         valid = df_fcf["FCF_B"].notna()
 
         if valid.any():
@@ -1514,7 +1441,7 @@ if run_button or ticker_symbol:
             )
 
         # Margins
-        ax = axes[1, 1]
+        ax = axes
 
         ax.plot(
             xlabels,
@@ -1562,7 +1489,7 @@ if run_button or ticker_symbol:
         )
 
         plt.tight_layout(
-            rect=[0, 0, 1, 0.98]
+            rect=
         )
 
         st.pyplot(fig)
@@ -1637,7 +1564,7 @@ if run_button or ticker_symbol:
         )
 
         # P/S
-        ax = axes2[0, 1]
+        ax = axes2
 
         if "P_S_TTM" in df_raw.columns:
             ax.plot(
@@ -1670,7 +1597,7 @@ if run_button or ticker_symbol:
         )
 
         # P/E
-        ax = axes2[1, 0]
+        ax = axes2
 
         if "P_E_TTM" in df_raw.columns:
             ax.plot(
@@ -1710,7 +1637,7 @@ if run_button or ticker_symbol:
         )
 
         # FCF yield
-        ax = axes2[1, 1]
+        ax = axes2
 
         if "FCF_Yield_%" in df_raw.columns:
             ax.plot(
@@ -1750,7 +1677,7 @@ if run_button or ticker_symbol:
         )
 
         plt.tight_layout(
-            rect=[0, 0, 1, 0.98]
+            rect=
         )
 
         st.pyplot(fig2)
@@ -1803,7 +1730,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        ax = axes3[1]
+        ax = axes3
 
         ax.plot(
             xlabels,
