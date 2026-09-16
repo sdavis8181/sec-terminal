@@ -76,8 +76,8 @@ with st.sidebar:
     st.markdown("---")
     st.caption(
         "SEC XBRL is the primary financial-statement source. "
-        "The parser derives quarterly OCF and Capex flows from cumulative YTD filings "
-        "when standalone quarter facts are absent."
+        "The parser derives quarterly flows from cumulative YTD filings and 10-K annuals "
+        "when standalone Q4 or quarterly facts are absent."
     )
 
 
@@ -387,7 +387,6 @@ def standalone_quarter_candidates(entries):
         form = str(e.get("form", "")).upper()
         frame = str(e.get("frame", ""))
 
-        # Support both Flow metrics and Instant/Balance-sheet facts (like shares)
         if entry_is_flow(e):
             days = entry_duration_days(e)
             if days is not None and 70 <= days <= 110:
@@ -401,7 +400,6 @@ def standalone_quarter_candidates(entries):
             if q_end is not None:
                 output.append({"entry": e, "period": q_end, "method": "SEC frame", "score": 50})
         else:
-            # Instantaneous balance-sheet entry (e.g. shares outstanding)
             score = 40
             if form in {"10-Q", "10-K"}:
                 score += 20
@@ -424,10 +422,15 @@ def pick_best_entry(candidates):
 
 
 # ============================================================
-# CASH FLOW YTD-TO-QUARTER DERIVATION
+# COMPREHENSIVE YTD-TO-QUARTER DERIVATION (INCOME & CASH FLOW)
 # ============================================================
 
-def derive_quarterly_cashflows(entries, field):
+def derive_quarterly_flows(entries, field):
+    """
+    Derives standalone quarterly flows for metrics reported as cumulative YTD (OCF, Capex)
+    and resolves missing Q4s for Income Statement metrics (Revenue, Op Inc, Net Inc)
+    by subtracting 9M cumulative or sum of Q1..Q3 from the full 10-K annual (12M).
+    """
     usable = []
     for e in entries:
         if not entry_is_flow(e):
@@ -464,6 +467,7 @@ def derive_quarterly_cashflows(entries, field):
         m9_rows = group[(group["days"] >= 250) & (group["days"] <= 300)]
         m12_rows = group[(group["days"] >= 340) & (group["days"] <= 385)]
 
+        # Q1: Direct
         if not q1_rows.empty:
             best_q1 = q1_rows.iloc[-1]
             derived_quarters[best_q1["end"].strftime("%Y-%m-%d")] = {
@@ -473,6 +477,7 @@ def derive_quarterly_cashflows(entries, field):
                 "entry": best_q1["entry"]
             }
 
+        # Q2: 6M - Q1 (for cumulative filers)
         if not m6_rows.empty and not q1_rows.empty:
             best_m6 = m6_rows.iloc[-1]
             best_q1 = q1_rows.iloc[-1]
@@ -483,6 +488,7 @@ def derive_quarterly_cashflows(entries, field):
                 "entry": best_m6["entry"]
             }
 
+        # Q3: 9M - 6M (for cumulative filers)
         if not m9_rows.empty and not m6_rows.empty:
             best_m9 = m9_rows.iloc[-1]
             best_m6 = m6_rows.iloc[-1]
@@ -493,15 +499,23 @@ def derive_quarterly_cashflows(entries, field):
                 "entry": best_m9["entry"]
             }
 
-        if not m12_rows.empty and not m9_rows.empty:
+        # Q4: Full 12M Annual - 9M Cumulative (Fills missing 4th quarter on all statements)
+        if not m12_rows.empty:
             best_m12 = m12_rows.iloc[-1]
-            best_m9 = m9_rows.iloc[-1]
-            derived_quarters[best_m12["end"].strftime("%Y-%m-%d")] = {
-                "val": best_m12["val"] - best_m9["val"],
-                "period": best_m12["end"],
-                "method": "derived (12M - 9M)",
-                "entry": best_m12["entry"]
-            }
+            val_q4 = np.nan
+            if not m9_rows.empty:
+                best_m9 = m9_rows.iloc[-1]
+                val_q4 = best_m12["val"] - best_m9["val"]
+            elif len(q1_rows) >= 1 and not m6_rows.empty:
+                val_q4 = best_m12["val"] - m6_rows.iloc[-1]["val"]
+
+            if pd.notna(val_q4):
+                derived_quarters[best_m12["end"].strftime("%Y-%m-%d")] = {
+                    "val": val_q4,
+                    "period": best_m12["end"],
+                    "method": "derived Q4 (12M - 9M)",
+                    "entry": best_m12["entry"]
+                }
 
     return derived_quarters
 
@@ -582,14 +596,16 @@ def build_quarterly_fact_table(companyfacts):
         fact_meta[field] = meta
         entries = meta["entries"]
 
-        if field in {"OCF", "Capex"}:
-            derived_map = derive_quarterly_cashflows(entries, field)
+        # Derive flows across periods (essential for OCF, Capex, and missing Q4 in Rev/Inc)
+        if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
+            derived_map = derive_quarterly_flows(entries, field)
             for key, item in derived_map.items():
                 quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
                 quarter_rows[key][field] = item["val"]
                 quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
                 quarter_rows[key][f"{field}_Method"] = item["method"]
 
+        # Overlay with direct standalone facts where present
         candidates = standalone_quarter_candidates(entries)
         grouped = {}
         for item in candidates:
@@ -606,11 +622,11 @@ def build_quarterly_fact_table(companyfacts):
 
             entry = best["entry"]
             quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
-            
-            if field not in quarter_rows[key] or pd.isna(quarter_rows[key][field]):
-                quarter_rows[key][field] = clean_number(entry.get("val"))
-                quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
-                quarter_rows[key][f"{field}_Method"] = best["method"]
+
+            # Direct standalone reports take priority for non-Q4
+            quarter_rows[key][field] = clean_number(entry.get("val"))
+            quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
+            quarter_rows[key][f"{field}_Method"] = best["method"]
 
     df = pd.DataFrame(list(quarter_rows.values()))
 
@@ -718,15 +734,9 @@ def calculate_metrics(df):
             work[col] = np.nan
         work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    work["Revenue_B"] = work["Revenue"] / 1e9
-    work["Rev_YoY_%"] = pct_change_safe(work["Revenue_B"], 4)
-    work["Rev_QoQ_%"] = pct_change_safe(work["Revenue_B"], 1)
-
-    work["EPS_YoY_%"] = pct_change_safe(work["Diluted_EPS"], 4).clip(-500, 500)
-    work["EPS_QoQ_%"] = pct_change_safe(work["Diluted_EPS"], 1).clip(-500, 500)
-
-    work["Op_Margin_%"] = safe_divide(work["Operating_Income"], work["Revenue"]) * 100
-    work["Net_Margin_%"] = safe_divide(work["Net_Income"], work["Revenue"]) * 100
+    # If diluted shares exist but EPS is missing (common in derived Q4), compute EPS = Net Income / Shares
+    missing_eps = work["Diluted_EPS"].isna() & work["Net_Income"].notna() & work["Diluted_Shares"].notna()
+    work.loc[missing_eps, "Diluted_EPS"] = safe_divide(work["Net_Income"], work["Diluted_Shares"])
 
     # Impute missing shares via Net Income / EPS
     implied = safe_divide(work["Net_Income"], work["Diluted_EPS"])
@@ -738,9 +748,20 @@ def calculate_metrics(df):
     )
     work.loc[missing_shares, "Diluted_Shares"] = implied[missing_shares]
 
-    # Forward-fill and backward-fill remaining missing shares so YoY line doesn't disconnect
+    # Continuous share count for dilution line
     clean_shares = work["Diluted_Shares"].replace(0, np.nan).ffill().bfill()
     work["Diluted_Shares_M"] = clean_shares / 1e6
+
+    work["Revenue_B"] = work["Revenue"] / 1e9
+    work["Rev_YoY_%"] = pct_change_safe(work["Revenue_B"], 4)
+    work["Rev_QoQ_%"] = pct_change_safe(work["Revenue_B"], 1)
+
+    work["EPS_YoY_%"] = pct_change_safe(work["Diluted_EPS"], 4).clip(-500, 500)
+    work["EPS_QoQ_%"] = pct_change_safe(work["Diluted_EPS"], 1).clip(-500, 500)
+
+    work["Op_Margin_%"] = safe_divide(work["Operating_Income"], work["Revenue"]) * 100
+    work["Net_Margin_%"] = safe_divide(work["Net_Income"], work["Revenue"]) * 100
+
     work["Share_Dilution_YoY_%"] = pct_change_safe(work["Diluted_Shares_M"], 4).clip(-50, 50)
 
     return work
@@ -963,8 +984,15 @@ if run_button or ticker_symbol:
             ax1.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax1_sub = ax1.twinx()
-            ax1_sub.plot(xlabels[valid_rev], df_raw.loc[valid_rev, "Rev_YoY_%"], marker="o", linewidth=1.5, label="YoY Growth (%)")
-            ax1_sub.plot(xlabels[valid_rev], df_raw.loc[valid_rev, "Rev_QoQ_%"], marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+            # Plot valid series connecting continuous points
+            yoy_rev = df_raw["Rev_YoY_%"].dropna()
+            if not yoy_rev.empty:
+                ax1_sub.plot(xlabels[yoy_rev.index], yoy_rev, marker="o", linewidth=1.5, label="YoY Growth (%)")
+            
+            qoq_rev = df_raw["Rev_QoQ_%"].dropna()
+            if not qoq_rev.empty:
+                ax1_sub.plot(xlabels[qoq_rev.index], qoq_rev, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+
             ax1_sub.set_ylabel("Growth (%)")
             ax1_sub.grid(False)
 
@@ -981,8 +1009,14 @@ if run_button or ticker_symbol:
             ax2.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax2_sub = ax2.twinx()
-            ax2_sub.plot(xlabels[valid_eps], df_raw.loc[valid_eps, "EPS_YoY_%"], marker="o", linewidth=1.5, label="YoY Growth (%)")
-            ax2_sub.plot(xlabels[valid_eps], df_raw.loc[valid_eps, "EPS_QoQ_%"], marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+            yoy_eps = df_raw["EPS_YoY_%"].dropna()
+            if not yoy_eps.empty:
+                ax2_sub.plot(xlabels[yoy_eps.index], yoy_eps, marker="o", linewidth=1.5, label="YoY Growth (%)")
+
+            qoq_eps = df_raw["EPS_QoQ_%"].dropna()
+            if not qoq_eps.empty:
+                ax2_sub.plot(xlabels[qoq_eps.index], qoq_eps, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+
             ax2_sub.set_ylabel("Growth (%)")
             ax2_sub.grid(False)
 
@@ -1000,8 +1034,14 @@ if run_button or ticker_symbol:
             ax3.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax3_sub = ax3.twinx()
-            ax3_sub.plot(fcf_labels, df_fcf.loc[valid_fcf, "FCF_YoY_%"], marker="o", linewidth=1.5, label="YoY Growth (%)")
-            ax3_sub.plot(fcf_labels, df_fcf.loc[valid_fcf, "FCF_QoQ_%"], marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+            yoy_fcf = df_fcf["FCF_YoY_%"].dropna()
+            if not yoy_fcf.empty:
+                ax3_sub.plot(xlabels[yoy_fcf.index], yoy_fcf, marker="o", linewidth=1.5, label="YoY Growth (%)")
+
+            qoq_fcf = df_fcf["FCF_QoQ_%"].dropna()
+            if not qoq_fcf.empty:
+                ax3_sub.plot(xlabels[qoq_fcf.index], qoq_fcf, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
+
             ax3_sub.set_ylabel("Growth (%)")
             ax3_sub.grid(False)
 
@@ -1009,9 +1049,15 @@ if run_button or ticker_symbol:
             h2, l2 = ax3_sub.get_legend_handles_labels()
             ax3.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=6.5)
 
-        # Margins
-        ax4.plot(xlabels, df_raw["Op_Margin_%"], marker="o", linewidth=2, label="Operating Margin (%)")
-        ax4.plot(xlabels, df_raw["Net_Margin_%"], marker="s", linestyle="--", linewidth=2, label="Net Margin (%)")
+        # Margins (Continuous lines)
+        valid_op_m = df_raw["Op_Margin_%"].dropna()
+        if not valid_op_m.empty:
+            ax4.plot(xlabels[valid_op_m.index], valid_op_m, marker="o", linewidth=2, label="Operating Margin (%)")
+
+        valid_net_m = df_raw["Net_Margin_%"].dropna()
+        if not valid_net_m.empty:
+            ax4.plot(xlabels[valid_net_m.index], valid_net_m, marker="s", linestyle="--", linewidth=2, label="Net Margin (%)")
+
         ax4.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
         ax4.set_title("Operating Margin vs. Net Margin (%)", fontweight="bold", fontsize=10.5)
         ax4.set_ylabel("Margin (%)")
@@ -1045,9 +1091,9 @@ if run_button or ticker_symbol:
         ax_p1.grid(True, linestyle="--", alpha=0.3)
 
         # P/S
-        valid_ps = df_raw["P_S_TTM"].notna()
-        if valid_ps.any():
-            ax_p2.plot(xlabels[valid_ps], df_raw.loc[valid_ps, "P_S_TTM"], marker="o", linewidth=2, label="P/S (TTM)")
+        valid_ps = df_raw["P_S_TTM"].dropna()
+        if not valid_ps.empty:
+            ax_p2.plot(xlabels[valid_ps.index], valid_ps, marker="o", linewidth=2, label="P/S (TTM)")
 
         ax_p2.set_title("Price-to-Sales (P/S) — TTM", fontweight="bold", fontsize=10.5)
         ax_p2.set_ylabel("P/S Multiple (x)")
@@ -1056,9 +1102,9 @@ if run_button or ticker_symbol:
         ax_p2.grid(True, linestyle="--", alpha=0.3)
 
         # P/E
-        valid_pe = df_raw["P_E_TTM"].notna()
-        if valid_pe.any():
-            ax_p3.plot(xlabels[valid_pe], df_raw.loc[valid_pe, "P_E_TTM"], marker="s", linewidth=2, label="P/E (TTM)")
+        valid_pe = df_raw["P_E_TTM"].dropna()
+        if not valid_pe.empty:
+            ax_p3.plot(xlabels[valid_pe.index], valid_pe, marker="s", linewidth=2, label="P/E (TTM)")
             ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
 
         ax_p3.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
@@ -1068,9 +1114,9 @@ if run_button or ticker_symbol:
         ax_p3.grid(True, linestyle="--", alpha=0.3)
 
         # FCF yield
-        valid_fcfy = df_raw["FCF_Yield_%"].notna()
-        if valid_fcfy.any():
-            ax_p4.plot(xlabels[valid_fcfy], df_raw.loc[valid_fcfy, "FCF_Yield_%"], marker="^", linewidth=2, label="FCF Yield (TTM %)")
+        valid_fcfy = df_raw["FCF_Yield_%"].dropna()
+        if not valid_fcfy.empty:
+            ax_p4.plot(xlabels[valid_fcfy.index], valid_fcfy, marker="^", linewidth=2, label="FCF Yield (TTM %)")
             ax_p4.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
 
         ax_p4.set_title("Free Cash Flow Yield — TTM", fontweight="bold", fontsize=10.5)
@@ -1092,7 +1138,6 @@ if run_button or ticker_symbol:
 
         fig3, (ax_c1, ax_c2) = plt.subplots(1, 2, figsize=(16, 5), dpi=150)
 
-        # Capex ($M instead of $B to clearly resolve small tech capex)
         ax_c1.bar(xlabels, df_raw["Capex"].abs() / 1e6, width=0.55, alpha=0.85, label="Capex ($M)")
         ax_c1.set_title("Quarterly Capital Expenditures ($M)", fontweight="bold", fontsize=10.5)
         ax_c1.set_ylabel("Capex ($M)")
@@ -1100,12 +1145,11 @@ if run_button or ticker_symbol:
         ax_c1.legend(loc="upper left", fontsize=7)
         ax_c1.grid(True, linestyle="--", alpha=0.3)
 
-        # Share dilution
-        valid_dilution = df_raw["Share_Dilution_YoY_%"].notna()
-        if valid_dilution.any():
+        valid_dilution = df_raw["Share_Dilution_YoY_%"].dropna()
+        if not valid_dilution.empty:
             ax_c2.plot(
-                xlabels[valid_dilution],
-                df_raw.loc[valid_dilution, "Share_Dilution_YoY_%"],
+                xlabels[valid_dilution.index],
+                valid_dilution,
                 marker="o",
                 linewidth=2,
                 label="Diluted Share Growth YoY (%)",
