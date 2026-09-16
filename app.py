@@ -24,11 +24,11 @@ st.set_page_config(
 
 st.title("Institutional SEC XBRL Financial Terminal")
 st.markdown(
-    "Quarterly financial data from SEC XBRL (US-GAAP & IFRS), with Yahoo Finance "
-    "used for market-price history and as a limited fallback."
+    "Quarterly financial data directly from SEC XBRL (US-GAAP & IFRS), "
+    "with Yahoo Finance for historical pricing and secondary fallback."
 )
 
-DEFAULT_IDENTITY = "Scott Davis scott@example.com"
+DEFAULT_IDENTITY = "FinancialTerminal User@example.com"
 try:
     SEC_IDENTITY = st.secrets.get("EDGAR_IDENTITY", DEFAULT_IDENTITY)
 except Exception:
@@ -50,36 +50,35 @@ TICKER_HEADERS = {
 }
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR CONTROLS
 # ============================================================
 
 with st.sidebar:
     st.header("Terminal Controls")
 
-    ticker_symbol = (
-        st.text_input("Stock Ticker", value="APP", max_chars=12)
-        .strip()
-        .upper()
-    )
+    with st.form(key="terminal_controls"):
+        ticker_symbol = (
+            st.text_input("Stock Ticker", value="AAPL", max_chars=12)
+            .strip()
+            .upper()
+        )
 
-    lookback_quarters = st.slider(
-        "Historical Lookback (Quarters)",
-        min_value=8,
-        max_value=40,
-        value=20,
-        step=4,
-    )
+        lookback_quarters = st.slider(
+            "Historical Lookback (Quarters)",
+            min_value=8,
+            max_value=40,
+            value=20,
+            step=4,
+        )
 
-    force_refresh = st.checkbox("Bypass Cache / Force Refresh", value=False)
-    run_button = st.button("Generate Report", type="primary")
+        force_refresh = st.checkbox("Bypass Cache / Force Refresh", value=False)
+        run_button = st.form_submit_button("Generate Report", type="primary")
 
     st.markdown("---")
     st.caption(
-        "SEC XBRL is the primary financial-statement source. "
-        "The parser derives quarterly flows from cumulative YTD filings and 10-K annuals "
-        "when standalone Q4 or quarterly facts are absent."
+        "Flows are derived from YTD statements ($6\\text{M}-3\\text{M}$, $9\\text{M}-6\\text{M}$, "
+        "$12\\text{M}-9\\text{M}$) to accurately back out standalone Q4 numbers."
     )
-
 
 # ============================================================
 # GENERAL HELPERS
@@ -88,10 +87,8 @@ with st.sidebar:
 def clean_number(value):
     if value is None:
         return np.nan
-
     if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value) if pd.notna(value) else np.nan
-
     try:
         if pd.isna(value):
             return np.nan
@@ -103,13 +100,7 @@ def clean_number(value):
         return np.nan
 
     negative = s.startswith("(") and s.endswith(")")
-    s = (
-        s.replace("$", "")
-        .replace(",", "")
-        .replace("%", "")
-        .replace("(", "")
-        .replace(")", "")
-    )
+    s = s.replace("$", "").replace(",", "").replace("%", "").replace("(", "").replace(")", "")
 
     try:
         x = float(s)
@@ -132,12 +123,8 @@ def as_date(value):
     return pd.to_datetime(value, errors="coerce")
 
 
-def normalize_text(value):
-    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
-
-
 # ============================================================
-# SEC API
+# SEC EDGAR APIS
 # ============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -147,53 +134,36 @@ def get_sec_ticker_map():
     response.raise_for_status()
 
     raw = response.json()
-    rows = []
-
-    for item in raw.values():
-        rows.append(
-            {
-                "ticker": str(item.get("ticker", "")).upper(),
-                "title": item.get("title", ""),
-                "cik": int(item.get("cik_str", 0)),
-            }
-        )
-
+    rows = [
+        {
+            "ticker": str(item.get("ticker", "")).upper(),
+            "title": item.get("title", ""),
+            "cik": int(item.get("cik_str", 0)),
+        }
+        for item in raw.values()
+    ]
     return pd.DataFrame(rows)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_cik_for_ticker(ticker):
     df = get_sec_ticker_map()
-
     match = df[df["ticker"].eq(ticker.upper())]
-
     if match.empty:
-        raise ValueError(
-            f"{ticker} was not found in the SEC ticker list."
-        )
-
+        raise ValueError(f"Ticker '{ticker}' not found in SEC EDGAR registries.")
     return int(match.iloc[0]["cik"])
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_companyfacts(cik):
-    url = (
-        "https://data.sec.gov/api/xbrl/companyfacts/CIK"
-        f"{int(cik):010d}.json"
-    )
-
-    response = requests.get(
-        url,
-        headers=SEC_HEADERS,
-        timeout=45,
-    )
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(cik):010d}.json"
+    response = requests.get(url, headers=SEC_HEADERS, timeout=45)
     response.raise_for_status()
-
     return response.json()
 
 
 # ============================================================
-# XBRL FACT DEFINITIONS (US-GAAP + IFRS)
+# XBRL CONCEPT DEFINITIONS
 # ============================================================
 
 FLOW_CONCEPTS = {
@@ -237,10 +207,9 @@ FLOW_CONCEPTS = {
         "PurchaseOfPropertyPlantAndEquipment",
         "PaymentsForAdditionsToPropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
+        "AdditionsToPropertyPlantAndEquipment",
         "PaymentsForSoftware",
         "PaymentsToAcquireIntangibleAssets",
-        "PaymentsToAcquirePropertyPlantAndEquipmentAndOtherPropertyPlantAndEquipment",
-        "AdditionsToPropertyPlantAndEquipment",
     ],
 }
 
@@ -256,7 +225,7 @@ FLOW_FIELDS = [
 
 
 # ============================================================
-# FACT UTILITIES
+# XBRL FACT PARSER
 # ============================================================
 
 def all_fact_candidates(companyfacts, field):
@@ -267,23 +236,14 @@ def all_fact_candidates(companyfacts, field):
     for taxonomy, taxonomy_facts in facts.items():
         if not isinstance(taxonomy_facts, dict):
             continue
-
         for concept in preferred:
             if concept in taxonomy_facts:
-                candidates.append(
-                    (
-                        taxonomy,
-                        concept,
-                        taxonomy_facts[concept],
-                    )
-                )
-
+                candidates.append((taxonomy, concept, taxonomy_facts[concept]))
     return candidates
 
 
 def choose_unit_name(concept_data, field):
     units = concept_data.get("units", {})
-
     if not units:
         return None
 
@@ -293,45 +253,23 @@ def choose_unit_name(concept_data, field):
                 return unit
 
     if field == "Diluted_Shares":
-        for unit in ["shares"]:
-            if unit in units:
-                return unit
+        if "shares" in units:
+            return "shares"
 
-    if field in {
-        "Revenue",
-        "Operating_Income",
-        "Net_Income",
-        "OCF",
-        "Capex",
-    }:
-        for unit in ["USD", "EUR", "BRL", "ARS"]:
-            if unit in units:
-                return unit
+    for unit in ["USD", "EUR", "GBP", "CAD", "BRL", "ARS"]:
+        if unit in units:
+            return unit
 
-        if len(units) == 1:
-            return next(iter(units.keys()))
-
-    if len(units) == 1:
-        return next(iter(units.keys()))
-
-    return None
+    return next(iter(units.keys())) if len(units) == 1 else None
 
 
 def get_preferred_entries(companyfacts, field):
-    candidates = all_fact_candidates(companyfacts, field)
-
-    for taxonomy, concept, concept_data in candidates:
+    for taxonomy, concept, concept_data in all_fact_candidates(companyfacts, field):
         unit = choose_unit_name(concept_data, field)
-
         if not unit:
             continue
-
         entries = concept_data["units"].get(unit, [])
-        usable = [
-            x for x in entries
-            if isinstance(x, dict) and "val" in x
-        ]
-
+        usable = [x for x in entries if isinstance(x, dict) and "val" in x]
         if usable:
             return {
                 "taxonomy": taxonomy,
@@ -339,7 +277,6 @@ def get_preferred_entries(companyfacts, field):
                 "unit": unit,
                 "entries": usable,
             }
-
     return None
 
 
@@ -350,25 +287,17 @@ def entry_date(entry, key):
 def entry_duration_days(entry):
     start = entry_date(entry, "start")
     end = entry_date(entry, "end")
-
     if pd.isna(start) or pd.isna(end):
         return None
-
     return (end - start).days + 1
-
-
-def entry_is_flow(entry):
-    return "start" in entry and "end" in entry
 
 
 def quarter_from_frame(frame):
     if not frame:
         return None
-
     match = re.search(r"CY(\d{4})Q([1-4])", str(frame))
     if not match:
         return None
-
     return pd.Timestamp(
         year=int(match.group(1)),
         month=int(match.group(2)) * 3,
@@ -378,21 +307,17 @@ def quarter_from_frame(frame):
 
 def standalone_quarter_candidates(entries):
     output = []
-
     for e in entries:
         end = entry_date(e, "end")
         if pd.isna(end):
             continue
-
         form = str(e.get("form", "")).upper()
         frame = str(e.get("frame", ""))
 
-        if entry_is_flow(e):
+        if "start" in e and "end" in e:
             days = entry_duration_days(e)
             if days is not None and 70 <= days <= 110:
-                score = 60
-                if form in {"10-Q", "20-F", "6-K"}:
-                    score += 20
+                score = 60 + (20 if form in {"10-Q", "20-F", "6-K"} else 0)
                 output.append({"entry": e, "period": end, "method": "duration", "score": score})
                 continue
 
@@ -400,9 +325,7 @@ def standalone_quarter_candidates(entries):
             if q_end is not None:
                 output.append({"entry": e, "period": q_end, "method": "SEC frame", "score": 50})
         else:
-            score = 40
-            if form in {"10-Q", "10-K"}:
-                score += 20
+            score = 40 + (20 if form in {"10-Q", "10-K"} else 0)
             output.append({"entry": e, "period": end, "method": "instant", "score": score})
 
     return output
@@ -411,55 +334,37 @@ def standalone_quarter_candidates(entries):
 def pick_best_entry(candidates):
     if not candidates:
         return None
+    return sorted(
+        candidates,
+        key=lambda x: (
+            str(x["entry"].get("filed", "") if "entry" in x else x.get("filed", "")),
+            str(x["entry"].get("accn", "") if "entry" in x else x.get("accn", "")),
+        ),
+    )[-1]
 
-    def sort_key(x):
-        e = x["entry"] if "entry" in x else x
-        filed = str(e.get("filed", ""))
-        accession = str(e.get("accn", ""))
-        return (filed, accession)
-
-    return sorted(candidates, key=sort_key)[-1]
-
-
-# ============================================================
-# COMPREHENSIVE YTD-TO-QUARTER DERIVATION (INCOME & CASH FLOW)
-# ============================================================
 
 def derive_quarterly_flows(entries, field):
-    """
-    Derives standalone quarterly flows for metrics reported as cumulative YTD (OCF, Capex)
-    and resolves missing Q4s for Income Statement metrics (Revenue, Op Inc, Net Inc)
-    by subtracting 9M cumulative or sum of Q1..Q3 from the full 10-K annual (12M).
-    """
     usable = []
     for e in entries:
-        if not entry_is_flow(e):
+        if "start" not in e or "end" not in e:
             continue
         days = entry_duration_days(e)
         val = clean_number(e.get("val"))
         fy = e.get("fy")
-        fp = str(e.get("fp", "")).upper()
-        form = str(e.get("form", "")).upper()
         end = entry_date(e, "end")
         filed = str(e.get("filed", ""))
 
         if days is not None and pd.notna(val) and pd.notna(end) and fy is not None:
             usable.append({
-                "entry": e,
-                "val": val,
-                "days": days,
-                "fy": fy,
-                "fp": fp,
-                "form": form,
-                "end": end,
-                "filed": filed
+                "entry": e, "val": val, "days": days, "fy": fy,
+                "end": end, "filed": filed
             })
 
     if not usable:
         return {}
 
     df_entries = pd.DataFrame(usable).sort_values(["fy", "end", "filed"])
-    derived_quarters = {}
+    derived = {}
 
     for fy, group in df_entries.groupby("fy"):
         q1_rows = group[(group["days"] >= 70) & (group["days"] <= 110)]
@@ -467,61 +372,44 @@ def derive_quarterly_flows(entries, field):
         m9_rows = group[(group["days"] >= 250) & (group["days"] <= 300)]
         m12_rows = group[(group["days"] >= 340) & (group["days"] <= 385)]
 
-        # Q1: Direct
         if not q1_rows.empty:
-            best_q1 = q1_rows.iloc[-1]
-            derived_quarters[best_q1["end"].strftime("%Y-%m-%d")] = {
-                "val": best_q1["val"],
-                "period": best_q1["end"],
-                "method": "direct Q1",
-                "entry": best_q1["entry"]
+            q1 = q1_rows.iloc[-1]
+            derived[q1["end"].strftime("%Y-%m-%d")] = {
+                "val": q1["val"], "period": q1["end"], "method": "direct Q1", "entry": q1["entry"]
             }
 
-        # Q2: 6M - Q1 (for cumulative filers)
         if not m6_rows.empty and not q1_rows.empty:
-            best_m6 = m6_rows.iloc[-1]
-            best_q1 = q1_rows.iloc[-1]
-            derived_quarters[best_m6["end"].strftime("%Y-%m-%d")] = {
-                "val": best_m6["val"] - best_q1["val"],
-                "period": best_m6["end"],
-                "method": "derived (6M - Q1)",
-                "entry": best_m6["entry"]
+            m6 = m6_rows.iloc[-1]
+            q1 = q1_rows.iloc[-1]
+            derived[m6["end"].strftime("%Y-%m-%d")] = {
+                "val": m6["val"] - q1["val"], "period": m6["end"], "method": "derived (6M - Q1)", "entry": m6["entry"]
             }
 
-        # Q3: 9M - 6M (for cumulative filers)
         if not m9_rows.empty and not m6_rows.empty:
-            best_m9 = m9_rows.iloc[-1]
-            best_m6 = m6_rows.iloc[-1]
-            derived_quarters[best_m9["end"].strftime("%Y-%m-%d")] = {
-                "val": best_m9["val"] - best_m6["val"],
-                "period": best_m9["end"],
-                "method": "derived (9M - 6M)",
-                "entry": best_m9["entry"]
+            m9 = m9_rows.iloc[-1]
+            m6 = m6_rows.iloc[-1]
+            derived[m9["end"].strftime("%Y-%m-%d")] = {
+                "val": m9["val"] - m6["val"], "period": m9["end"], "method": "derived (9M - 6M)", "entry": m9["entry"]
             }
 
-        # Q4: Full 12M Annual - 9M Cumulative (Fills missing 4th quarter on all statements)
         if not m12_rows.empty:
-            best_m12 = m12_rows.iloc[-1]
+            m12 = m12_rows.iloc[-1]
             val_q4 = np.nan
             if not m9_rows.empty:
-                best_m9 = m9_rows.iloc[-1]
-                val_q4 = best_m12["val"] - best_m9["val"]
+                val_q4 = m12["val"] - m9_rows.iloc[-1]["val"]
             elif len(q1_rows) >= 1 and not m6_rows.empty:
-                val_q4 = best_m12["val"] - m6_rows.iloc[-1]["val"]
+                val_q4 = m12["val"] - m6_rows.iloc[-1]["val"]
 
             if pd.notna(val_q4):
-                derived_quarters[best_m12["end"].strftime("%Y-%m-%d")] = {
-                    "val": val_q4,
-                    "period": best_m12["end"],
-                    "method": "derived Q4 (12M - 9M)",
-                    "entry": best_m12["entry"]
+                derived[m12["end"].strftime("%Y-%m-%d")] = {
+                    "val": val_q4, "period": m12["end"], "method": "derived Q4 (12M - 9M)", "entry": m12["entry"]
                 }
 
-    return derived_quarters
+    return derived
 
 
 # ============================================================
-# DEDUPLICATOR & SNAP ENGINE
+# DATA MERGING & METRICS
 # ============================================================
 
 def collapse_duplicate_quarters(df, tolerance_days=45):
@@ -551,7 +439,6 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
         canonical_period = canonical_row["Period"]
 
         merged_record = {"Period": canonical_period}
-
         for col in df.columns:
             if col == "Period":
                 continue
@@ -578,17 +465,12 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
     return pd.DataFrame(unified_rows).sort_values("Period").reset_index(drop=True)
 
 
-# ============================================================
-# BUILD QUARTERLY DATA
-# ============================================================
-
 def build_quarterly_fact_table(companyfacts):
     fact_meta = {}
     quarter_rows = {}
 
     for field in FLOW_FIELDS:
         meta = get_preferred_entries(companyfacts, field)
-
         if not meta:
             fact_meta[field] = None
             continue
@@ -596,7 +478,6 @@ def build_quarterly_fact_table(companyfacts):
         fact_meta[field] = meta
         entries = meta["entries"]
 
-        # Derive flows across periods (essential for OCF, Capex, and missing Q4 in Rev/Inc)
         if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
             derived_map = derive_quarterly_flows(entries, field)
             for key, item in derived_map.items():
@@ -605,43 +486,32 @@ def build_quarterly_fact_table(companyfacts):
                 quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
                 quarter_rows[key][f"{field}_Method"] = item["method"]
 
-        # Overlay with direct standalone facts where present
         candidates = standalone_quarter_candidates(entries)
         grouped = {}
         for item in candidates:
-            period = item["period"]
-            if pd.isna(period):
+            p = item["period"]
+            if pd.isna(p):
                 continue
-            key = period.strftime("%Y-%m-%d")
-            grouped.setdefault(key, []).append(item)
+            grouped.setdefault(p.strftime("%Y-%m-%d"), []).append(item)
 
         for key, group in grouped.items():
             best = pick_best_entry(group)
             if best is None:
                 continue
-
             entry = best["entry"]
             quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
-
-            # Direct standalone reports take priority for non-Q4
             quarter_rows[key][field] = clean_number(entry.get("val"))
             quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
             quarter_rows[key][f"{field}_Method"] = best["method"]
 
     df = pd.DataFrame(list(quarter_rows.values()))
-
     if df.empty:
         return df, fact_meta
 
     df = collapse_duplicate_quarters(df, tolerance_days=45)
     df = df[df["Period"] >= pd.Timestamp("2017-01-01")].reset_index(drop=True)
-
     return df, fact_meta
 
-
-# ============================================================
-# YAHOO FALLBACK / SUPPLEMENT
-# ============================================================
 
 YF_KEYS = {
     "Revenue": ["Total Revenue", "Operating Revenue", "Revenue"],
@@ -654,27 +524,9 @@ YF_KEYS = {
 }
 
 
-def yahoo_row_value(df, keys, date_col):
-    if df is None or df.empty:
-        return np.nan
-
-    for key in keys:
-        if key in df.index:
-            try:
-                return clean_number(df.loc[key, date_col])
-            except Exception:
-                pass
-
-    return np.nan
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_yahoo_quarterly(ticker):
-    diagnostics = []
-
     try:
         tk = yf.Ticker(ticker)
-
         inc = tk.quarterly_income_stmt
         cf = tk.quarterly_cashflow
 
@@ -687,71 +539,51 @@ def fetch_yahoo_quarterly(ticker):
             if pd.isna(period):
                 continue
 
-            rows.append(
-                {
-                    "Period": period,
-                    "Source": "Yahoo Finance",
-                    "Revenue": yahoo_row_value(inc, YF_KEYS["Revenue"], date_col),
-                    "Operating_Income": yahoo_row_value(inc, YF_KEYS["Operating_Income"], date_col),
-                    "Net_Income": yahoo_row_value(inc, YF_KEYS["Net_Income"], date_col),
-                    "Diluted_EPS": yahoo_row_value(inc, YF_KEYS["Diluted_EPS"], date_col),
-                    "Diluted_Shares": yahoo_row_value(inc, YF_KEYS["Diluted_Shares"], date_col),
-                    "OCF": yahoo_row_value(cf, YF_KEYS["OCF"], date_col),
-                    "Capex": yahoo_row_value(cf, YF_KEYS["Capex"], date_col),
-                }
-            )
+            def get_yf_val(df_source, keys):
+                if df_source is None or df_source.empty:
+                    return np.nan
+                for k in keys:
+                    if k in df_source.index:
+                        return clean_number(df_source.loc[k, date_col])
+                return np.nan
 
-        return pd.DataFrame(rows), diagnostics
-
+            rows.append({
+                "Period": period,
+                "Source": "Yahoo Finance",
+                "Revenue": get_yf_val(inc, YF_KEYS["Revenue"]),
+                "Operating_Income": get_yf_val(inc, YF_KEYS["Operating_Income"]),
+                "Net_Income": get_yf_val(inc, YF_KEYS["Net_Income"]),
+                "Diluted_EPS": get_yf_val(inc, YF_KEYS["Diluted_EPS"]),
+                "Diluted_Shares": get_yf_val(inc, YF_KEYS["Diluted_Shares"]),
+                "OCF": get_yf_val(cf, YF_KEYS["OCF"]),
+                "Capex": get_yf_val(cf, YF_KEYS["Capex"]),
+            })
+        return pd.DataFrame(rows), []
     except Exception as exc:
-        return pd.DataFrame(), [f"Yahoo error: {type(exc).__name__}: {exc}"]
+        return pd.DataFrame(), [f"Yahoo error: {exc}"]
 
-
-def merge_sec_yahoo(sec_df, yahoo_df):
-    if sec_df.empty:
-        return yahoo_df.copy()
-    if yahoo_df.empty:
-        return sec_df.copy()
-
-    combined = pd.concat([sec_df, yahoo_df], ignore_index=True)
-    return collapse_duplicate_quarters(combined, tolerance_days=45)
-
-
-# ============================================================
-# FINANCIAL DERIVATIONS
-# ============================================================
 
 def calculate_metrics(df):
     work = df.copy()
-
-    numeric_cols = [
-        "Revenue", "Operating_Income", "Net_Income",
-        "Diluted_EPS", "Diluted_Shares", "OCF", "Capex",
-    ]
-
-    for col in numeric_cols:
+    for col in FLOW_FIELDS:
         if col not in work.columns:
             work[col] = np.nan
         work[col] = pd.to_numeric(work[col], errors="coerce")
 
-    # If diluted shares exist but EPS is missing (common in derived Q4), compute EPS = Net Income / Shares
+    # Reconcile Shares & EPS
     missing_eps = work["Diluted_EPS"].isna() & work["Net_Income"].notna() & work["Diluted_Shares"].notna()
     work.loc[missing_eps, "Diluted_EPS"] = safe_divide(work["Net_Income"], work["Diluted_Shares"])
 
-    # Impute missing shares via Net Income / EPS
-    implied = safe_divide(work["Net_Income"], work["Diluted_EPS"])
+    implied_shares = safe_divide(work["Net_Income"], work["Diluted_EPS"])
     missing_shares = (
         work["Diluted_Shares"].isna()
-        & implied.notna()
+        & implied_shares.notna()
         & (work["Diluted_EPS"].abs() > 0.005)
-        & (implied > 0)
+        & (implied_shares > 0)
     )
-    work.loc[missing_shares, "Diluted_Shares"] = implied[missing_shares]
+    work.loc[missing_shares, "Diluted_Shares"] = implied_shares[missing_shares]
 
-    # Continuous share count for dilution line
-    clean_shares = work["Diluted_Shares"].replace(0, np.nan).ffill().bfill()
-    work["Diluted_Shares_M"] = clean_shares / 1e6
-
+    work["Diluted_Shares_M"] = work["Diluted_Shares"].replace(0, np.nan).ffill().bfill() / 1e6
     work["Revenue_B"] = work["Revenue"] / 1e9
     work["Rev_YoY_%"] = pct_change_safe(work["Revenue_B"], 4)
     work["Rev_QoQ_%"] = pct_change_safe(work["Revenue_B"], 1)
@@ -761,19 +593,10 @@ def calculate_metrics(df):
 
     work["Op_Margin_%"] = safe_divide(work["Operating_Income"], work["Revenue"]) * 100
     work["Net_Margin_%"] = safe_divide(work["Net_Income"], work["Revenue"]) * 100
-
     work["Share_Dilution_YoY_%"] = pct_change_safe(work["Diluted_Shares_M"], 4).clip(-50, 50)
 
-    return work
-
-
-def calculate_fcf(df):
-    work = df[["Period", "OCF", "Capex", "Source"]].copy()
-
-    work["OCF"] = pd.to_numeric(work["OCF"], errors="coerce")
-    work["Capex"] = pd.to_numeric(work["Capex"], errors="coerce")
+    # Free Cash Flow
     work["Capex_Positive"] = work["Capex"].abs().fillna(0.0)
-
     work["FCF"] = np.where(work["OCF"].notna(), work["OCF"] - work["Capex_Positive"], np.nan)
     work["FCF_B"] = work["FCF"] / 1e9
     work["FCF_YoY_%"] = pct_change_safe(work["FCF"], 4).clip(-500, 500)
@@ -782,27 +605,20 @@ def calculate_fcf(df):
     return work
 
 
-def calculate_trailing_flow(series):
+def calculate_trailing_flow_strict(series):
     s = pd.to_numeric(series, errors="coerce")
-    roll_sum = s.rolling(4, min_periods=1).sum()
-    roll_count = s.rolling(4, min_periods=1).count()
-    return np.where(roll_count > 0, (roll_sum / roll_count) * 4.0, np.nan)
+    return s.rolling(window=4, min_periods=4).sum()
 
 
 # ============================================================
-# MARKET DATA
+# MARKET PRICING
 # ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_market_data(ticker):
     try:
         tk = yf.Ticker(ticker)
-        info = {}
-        try:
-            info = tk.info or {}
-        except Exception:
-            pass
-
+        info = tk.info or {}
         current_price = (
             info.get("currentPrice")
             or info.get("regularMarketPrice")
@@ -811,18 +627,19 @@ def fetch_market_data(ticker):
         shares_outstanding = info.get("sharesOutstanding")
         market_cap = info.get("marketCap")
 
-        hist = tk.history(period="2y", auto_adjust=False)
+        # Fetch up to 10y daily history for historical multiple tracking
+        hist = tk.history(period="10y", auto_adjust=False)
 
-        if current_price is None and hist is not None and not hist.empty:
-            current_price = clean_number(hist["Close"].iloc[-1])
+        if hist is not None and not hist.empty:
+            hist.index = pd.to_datetime(hist.index).tz_localize(None)
+            hist = hist.sort_index()
+            if current_price is None:
+                current_price = clean_number(hist["Close"].iloc[-1])
+            hist["EMA50"] = hist["Close"].ewm(span=50, adjust=False).mean()
+            hist["EMA200"] = hist["Close"].ewm(span=200, adjust=False).mean()
 
         if market_cap is None and current_price is not None and shares_outstanding is not None:
             market_cap = current_price * shares_outstanding
-
-        if hist is not None and not hist.empty:
-            hist = hist.copy()
-            hist["EMA50"] = hist["Close"].ewm(span=50, adjust=False).mean()
-            hist["EMA200"] = hist["Close"].ewm(span=200, adjust=False).mean()
 
         return (
             hist,
@@ -830,236 +647,191 @@ def fetch_market_data(ticker):
             clean_number(market_cap),
             clean_number(shares_outstanding),
         )
-
     except Exception:
         return pd.DataFrame(), np.nan, np.nan, np.nan
 
 
 # ============================================================
-# SEC DATA PIPELINE
+# SEC PIPELINE
 # ============================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_and_parse_ticker(ticker, refresh_nonce=0):
     diagnostics = []
-
     cik = get_cik_for_ticker(ticker)
     companyfacts = get_companyfacts(cik)
 
     sec_df, fact_meta = build_quarterly_fact_table(companyfacts)
-
     if sec_df.empty:
         diagnostics.append("SEC Company Facts did not yield standalone quarterly flow facts.")
 
     yahoo_df, yahoo_diag = fetch_yahoo_quarterly(ticker)
     diagnostics.extend(yahoo_diag)
 
-    df = merge_sec_yahoo(sec_df, yahoo_df)
+    if sec_df.empty and yahoo_df.empty:
+        raise ValueError(f"No quarterly data found for {ticker}.")
 
-    if df.empty:
-        raise ValueError(f"No usable quarterly data found for {ticker}.")
-
+    combined = pd.concat([sec_df, yahoo_df], ignore_index=True)
+    df = collapse_duplicate_quarters(combined, tolerance_days=45)
     df = calculate_metrics(df)
 
     return df, fact_meta, diagnostics
 
 
 # ============================================================
-# RUN
+# MAIN EXECUTION
 # ============================================================
 
-if run_button or ticker_symbol:
+if ticker_symbol:
     try:
         nonce = np.random.randint(1, 1000000) if force_refresh else 0
 
-        with st.spinner(f"Loading SEC XBRL and market data for {ticker_symbol}..."):
+        with st.spinner(f"Loading SEC XBRL statements for {ticker_symbol}..."):
             df_all, fact_meta, diagnostics = fetch_and_parse_ticker(ticker_symbol, refresh_nonce=nonce)
             hist_price, current_price, market_cap, shares_outstanding = fetch_market_data(ticker_symbol)
 
         df_raw = df_all.tail(lookback_quarters).reset_index(drop=True)
-        df_fcf = calculate_fcf(df_raw)
 
         # ----------------------------------------------------
-        # TTM VALUATION
+        # TTM AND AS-OF HISTORICAL VALUATION
         # ----------------------------------------------------
+        df_raw["TTM_Revenue"] = calculate_trailing_flow_strict(df_raw["Revenue"])
+        df_raw["TTM_EPS"] = calculate_trailing_flow_strict(df_raw["Diluted_EPS"])
+        df_raw["TTM_FCF"] = calculate_trailing_flow_strict(df_raw["FCF"])
 
-        df_raw["TTM_Revenue"] = calculate_trailing_flow(df_raw["Revenue"])
-        df_raw["TTM_EPS"] = calculate_trailing_flow(df_raw["Diluted_EPS"])
-        df_fcf["TTM_FCF"] = calculate_trailing_flow(df_fcf["FCF"])
+        # Map each quarterly period end to the historical stock price at that date
+        if hist_price is not None and not hist_price.empty:
+            prices_at_quarter = []
+            for q_date in df_raw["Period"]:
+                historical_closes = hist_price.loc[hist_price.index <= q_date, "Close"]
+                prices_at_quarter.append(historical_closes.iloc[-1] if not historical_closes.empty else np.nan)
+            df_raw["Historical_Close"] = prices_at_quarter
+        else:
+            df_raw["Historical_Close"] = np.nan
 
-        if pd.notna(market_cap) and market_cap > 0 and pd.notna(current_price) and current_price > 0:
-            df_raw["P_S_TTM"] = safe_divide(market_cap, df_raw["TTM_Revenue"]).clip(lower=0, upper=150)
-            df_raw["P_E_TTM"] = safe_divide(current_price, df_raw["TTM_EPS"]).where(df_raw["TTM_EPS"] > 0).clip(lower=0, upper=250)
-            df_raw["TTM_FCF"] = df_fcf["TTM_FCF"].values
-            df_raw["FCF_Yield_%"] = (df_raw["TTM_FCF"] / market_cap) * 100
+        # Calculate True Point-In-Time Historical Multiples
+        df_raw["P_E_TTM"] = safe_divide(df_raw["Historical_Close"], df_raw["TTM_EPS"]).where(df_raw["TTM_EPS"] > 0).clip(0, 250)
+        implied_hist_cap = df_raw["Historical_Close"] * (df_raw["Diluted_Shares_M"] * 1e6)
+        df_raw["P_S_TTM"] = safe_divide(implied_hist_cap, df_raw["TTM_Revenue"]).clip(0, 150)
+        df_raw["FCF_Yield_%"] = (safe_divide(df_raw["TTM_FCF"], implied_hist_cap) * 100).clip(-50, 100)
 
         # ----------------------------------------------------
-        # HEADER
+        # DASHBOARD HEADER
         # ----------------------------------------------------
-
         st.subheader(f"{ticker_symbol} — Executive Financial Dashboard")
         c1, c2, c3, c4 = st.columns(4)
-
-        with c1:
-            st.metric("Current Price", f"${current_price:,.2f}" if pd.notna(current_price) else "N/A")
-        with c2:
-            st.metric("Market Cap", f"${market_cap / 1e9:,.2f}B" if pd.notna(market_cap) else "N/A")
-        with c3:
-            st.metric("SEC / XBRL Quarters", str(df_all["Source"].astype(str).str.contains("SEC").sum()))
-        with c4:
-            st.metric("Quarterly Records", str(len(df_all)))
+        c1.metric("Current Price", f"${current_price:,.2f}" if pd.notna(current_price) else "N/A")
+        c2.metric("Market Cap", f"${market_cap / 1e9:,.2f}B" if pd.notna(market_cap) else "N/A")
+        c3.metric("XBRL Quarters Extracted", str(df_all["Source"].astype(str).str.contains("SEC").sum()))
+        c4.metric("Total Filings Analysed", str(len(df_all)))
 
         # ----------------------------------------------------
-        # DIAGNOSTICS
+        # DIAGNOSTICS ACCORDION
         # ----------------------------------------------------
-
-        with st.expander("Data Source Diagnostics", expanded=False):
-            st.write("**Quarterly source by period:**")
-            diag_cols = ["Period", "Source"]
-            for col in [
-                "Revenue_Concept", "Revenue_Method", "Diluted_EPS_Concept", "Diluted_EPS_Method",
-                "Diluted_Shares_Concept", "Diluted_Shares_Method", "OCF_Concept", "OCF_Method",
-                "Capex_Concept", "Capex_Method",
-            ]:
-                if col in df_all.columns:
-                    diag_cols.append(col)
-
-            st.dataframe(df_all[diag_cols].tail(20), use_container_width=True)
+        with st.expander("Data Source Lineage & Diagnostics", expanded=False):
+            diag_cols = ["Period", "Source"] + [
+                c for c in df_all.columns if c.endswith("_Concept") or c.endswith("_Method")
+            ]
+            st.dataframe(df_all[[c for c in diag_cols if c in df_all.columns]].tail(20), use_container_width=True)
 
             if fact_meta:
-                st.write("**XBRL concepts selected:**")
-                concept_rows = []
-                for field, meta in fact_meta.items():
-                    if meta:
-                        concept_rows.append(
-                            {
-                                "Metric": field,
-                                "Taxonomy": meta["taxonomy"],
-                                "Concept": meta["concept"],
-                                "Unit": meta["unit"],
-                            }
-                        )
-                if concept_rows:
-                    st.dataframe(pd.DataFrame(concept_rows), use_container_width=True)
+                concept_rows = [
+                    {"Metric": k, "Taxonomy": v["taxonomy"], "Concept": v["concept"], "Unit": v["unit"]}
+                    for k, v in fact_meta.items() if v
+                ]
+                st.dataframe(pd.DataFrame(concept_rows), use_container_width=True)
 
             if diagnostics:
-                st.write("**Diagnostics:**")
-                for message in diagnostics[-20:]:
-                    st.caption(message)
+                for msg in diagnostics[-10:]:
+                    st.caption(msg)
 
         # ----------------------------------------------------
-        # RAW TABLE
+        # RAW DATA ACCORDION
         # ----------------------------------------------------
-
         with st.expander("Quarterly Financial Dataset", expanded=False):
             display = df_raw.copy()
             display["Period"] = display["Period"].dt.strftime("%Y-%m-%d")
-
             display_cols = [
                 "Period", "Source", "Revenue_B", "Rev_YoY_%", "Diluted_EPS", "EPS_YoY_%",
                 "Operating_Income", "Op_Margin_%", "Net_Income", "Net_Margin_%",
-                "OCF", "Capex", "Diluted_Shares_M", "Share_Dilution_YoY_%",
+                "OCF", "Capex", "FCF_B", "Diluted_Shares_M", "Share_Dilution_YoY_%",
             ]
-            display_cols = [c for c in display_cols if c in display.columns]
-            st.dataframe(display[display_cols], use_container_width=True)
+            st.dataframe(display[[c for c in display_cols if c in display.columns]], use_container_width=True)
 
         # ----------------------------------------------------
-        # CHART 1: FINANCIALS
+        # CHARTS: FINANCIAL PERFORMANCE
         # ----------------------------------------------------
-
         st.markdown("---")
         st.subheader(f"{ticker_symbol} — Financial Performance")
 
         fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
-        fig.suptitle(f"{ticker_symbol} Financial & Growth Dashboard", fontsize=15, fontweight="bold", y=0.98)
-
+        fig.suptitle(f"{ticker_symbol} Operational & Flow Fundamentals", fontsize=14, fontweight="bold", y=0.98)
         xlabels = df_raw["Period"].dt.strftime("%Y-%m-%d")
 
-        # Revenue
-        valid_rev = df_raw["Revenue_B"].notna()
-        if valid_rev.any():
-            ax1.bar(xlabels[valid_rev], df_raw.loc[valid_rev, "Revenue_B"], width=0.55, alpha=0.85, label="Revenue ($B)")
-            ax1.set_title("Revenue ($B) & Growth", fontweight="bold", fontsize=10.5)
+        # 1. Revenue
+        if df_raw["Revenue_B"].notna().any():
+            ax1.bar(xlabels, df_raw["Revenue_B"], width=0.55, alpha=0.85, label="Revenue ($B)", color="#1f77b4")
+            ax1.set_title("Revenue ($B) & YoY Growth", fontweight="bold", fontsize=10.5)
             ax1.set_ylabel("Revenue ($B)")
             ax1.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax1_sub = ax1.twinx()
-            # Plot valid series connecting continuous points
             yoy_rev = df_raw["Rev_YoY_%"].dropna()
             if not yoy_rev.empty:
-                ax1_sub.plot(xlabels[yoy_rev.index], yoy_rev, marker="o", linewidth=1.5, label="YoY Growth (%)")
-            
-            qoq_rev = df_raw["Rev_QoQ_%"].dropna()
-            if not qoq_rev.empty:
-                ax1_sub.plot(xlabels[qoq_rev.index], qoq_rev, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
-
+                ax1_sub.plot(xlabels[yoy_rev.index], yoy_rev, marker="o", color="#ff7f0e", linewidth=1.5, label="YoY Growth (%)")
             ax1_sub.set_ylabel("Growth (%)")
             ax1_sub.grid(False)
 
             h1, l1 = ax1.get_legend_handles_labels()
             h2, l2 = ax1_sub.get_legend_handles_labels()
-            ax1.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=6.5)
+            ax1.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
 
-        # EPS
-        valid_eps = df_raw["Diluted_EPS"].notna()
-        if valid_eps.any():
-            ax2.bar(xlabels[valid_eps], df_raw.loc[valid_eps, "Diluted_EPS"], width=0.55, alpha=0.85, label="Diluted EPS ($)")
-            ax2.set_title("Diluted EPS ($) & Growth", fontweight="bold", fontsize=10.5)
+        # 2. EPS
+        if df_raw["Diluted_EPS"].notna().any():
+            ax2.bar(xlabels, df_raw["Diluted_EPS"], width=0.55, alpha=0.85, label="Diluted EPS ($)", color="#2ca02c")
+            ax2.set_title("Diluted EPS ($) & YoY Growth", fontweight="bold", fontsize=10.5)
             ax2.set_ylabel("EPS ($)")
             ax2.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax2_sub = ax2.twinx()
             yoy_eps = df_raw["EPS_YoY_%"].dropna()
             if not yoy_eps.empty:
-                ax2_sub.plot(xlabels[yoy_eps.index], yoy_eps, marker="o", linewidth=1.5, label="YoY Growth (%)")
-
-            qoq_eps = df_raw["EPS_QoQ_%"].dropna()
-            if not qoq_eps.empty:
-                ax2_sub.plot(xlabels[qoq_eps.index], qoq_eps, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
-
+                ax2_sub.plot(xlabels[yoy_eps.index], yoy_eps, marker="o", color="#d62728", linewidth=1.5, label="YoY Growth (%)")
             ax2_sub.set_ylabel("Growth (%)")
             ax2_sub.grid(False)
 
             h1, l1 = ax2.get_legend_handles_labels()
             h2, l2 = ax2_sub.get_legend_handles_labels()
-            ax2.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=6.5)
+            ax2.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
 
-        # FCF
-        valid_fcf = df_fcf["FCF_B"].notna()
-        if valid_fcf.any():
-            fcf_labels = df_fcf.loc[valid_fcf, "Period"].dt.strftime("%Y-%m-%d")
-            ax3.bar(fcf_labels, df_fcf.loc[valid_fcf, "FCF_B"], width=0.55, alpha=0.85, label="Free Cash Flow ($B)")
-            ax3.set_title("Standalone Quarterly Free Cash Flow ($B) & Growth", fontweight="bold", fontsize=10.5)
+        # 3. FCF
+        if df_raw["FCF_B"].notna().any():
+            ax3.bar(xlabels, df_raw["FCF_B"], width=0.55, alpha=0.85, label="Free Cash Flow ($B)", color="#9467bd")
+            ax3.set_title("Standalone Free Cash Flow ($B) & YoY Growth", fontweight="bold", fontsize=10.5)
             ax3.set_ylabel("FCF ($B)")
             ax3.tick_params(axis="x", rotation=45, labelsize=7)
 
             ax3_sub = ax3.twinx()
-            yoy_fcf = df_fcf["FCF_YoY_%"].dropna()
+            yoy_fcf = df_raw["FCF_YoY_%"].dropna()
             if not yoy_fcf.empty:
-                ax3_sub.plot(xlabels[yoy_fcf.index], yoy_fcf, marker="o", linewidth=1.5, label="YoY Growth (%)")
-
-            qoq_fcf = df_fcf["FCF_QoQ_%"].dropna()
-            if not qoq_fcf.empty:
-                ax3_sub.plot(xlabels[qoq_fcf.index], qoq_fcf, marker="s", linestyle="--", linewidth=1.2, label="QoQ Growth (%)")
-
+                ax3_sub.plot(xlabels[yoy_fcf.index], yoy_fcf, marker="o", color="#8c564b", linewidth=1.5, label="YoY Growth (%)")
             ax3_sub.set_ylabel("Growth (%)")
             ax3_sub.grid(False)
 
             h1, l1 = ax3.get_legend_handles_labels()
             h2, l2 = ax3_sub.get_legend_handles_labels()
-            ax3.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=6.5)
+            ax3.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
 
-        # Margins (Continuous lines)
-        valid_op_m = df_raw["Op_Margin_%"].dropna()
-        if not valid_op_m.empty:
-            ax4.plot(xlabels[valid_op_m.index], valid_op_m, marker="o", linewidth=2, label="Operating Margin (%)")
+        # 4. Margins
+        valid_op = df_raw["Op_Margin_%"].dropna()
+        valid_net = df_raw["Net_Margin_%"].dropna()
+        if not valid_op.empty:
+            ax4.plot(xlabels[valid_op.index], valid_op, marker="o", linewidth=2, label="Operating Margin (%)", color="#1f77b4")
+        if not valid_net.empty:
+            ax4.plot(xlabels[valid_net.index], valid_net, marker="s", linestyle="--", linewidth=2, label="Net Margin (%)", color="#2ca02c")
 
-        valid_net_m = df_raw["Net_Margin_%"].dropna()
-        if not valid_net_m.empty:
-            ax4.plot(xlabels[valid_net_m.index], valid_net_m, marker="s", linestyle="--", linewidth=2, label="Net Margin (%)")
-
-        ax4.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-        ax4.set_title("Operating Margin vs. Net Margin (%)", fontweight="bold", fontsize=10.5)
+        ax4.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
+        ax4.set_title("Operating Margin vs Net Margin (%)", fontweight="bold", fontsize=10.5)
         ax4.set_ylabel("Margin (%)")
         ax4.tick_params(axis="x", rotation=45, labelsize=7)
         ax4.legend(loc="upper left", fontsize=7)
@@ -1070,56 +842,54 @@ if run_button or ticker_symbol:
         plt.close(fig)
 
         # ----------------------------------------------------
-        # CHART 2: VALUATION / PRICE
+        # CHARTS: HISTORICAL VALUATION & PRICE
         # ----------------------------------------------------
-
         st.markdown("---")
-        st.subheader(f"{ticker_symbol} — Valuation & Price Action")
+        st.subheader(f"{ticker_symbol} — Historical Valuation & Price Action")
 
         fig2, ((ax_p1, ax_p2), (ax_p3, ax_p4)) = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
-        fig2.suptitle(f"{ticker_symbol} Price Action & Valuation", fontsize=15, fontweight="bold", y=0.98)
+        fig2.suptitle(f"{ticker_symbol} As-Of Period Valuation (Non-Distorted)", fontsize=14, fontweight="bold", y=0.98)
 
-        # Price
+        # 1. Daily Price & EMAs (Last 2 Years)
         if hist_price is not None and not hist_price.empty:
-            ax_p1.plot(hist_price.index, hist_price["Close"], linewidth=1.5, label="Close Price ($)")
-            ax_p1.plot(hist_price.index, hist_price["EMA50"], linewidth=1.2, label="50-Day EMA")
-            ax_p1.plot(hist_price.index, hist_price["EMA200"], linestyle="--", linewidth=1.2, label="200-Day EMA")
+            two_years_ago = hist_price.index.max() - pd.DateOffset(years=2)
+            recent_hist = hist_price[hist_price.index >= two_years_ago]
+            ax_p1.plot(recent_hist.index, recent_hist["Close"], linewidth=1.5, label="Close Price ($)", color="black")
+            ax_p1.plot(recent_hist.index, recent_hist["EMA50"], linewidth=1.2, label="50-Day EMA", color="#1f77b4")
+            ax_p1.plot(recent_hist.index, recent_hist["EMA200"], linestyle="--", linewidth=1.2, label="200-Day EMA", color="#d62728")
 
-        ax_p1.set_title("Daily Stock Price vs 50/200 EMA", fontweight="bold", fontsize=10.5)
+        ax_p1.set_title("Daily Stock Price vs 50/200 EMA (2-Year)", fontweight="bold", fontsize=10.5)
         ax_p1.set_ylabel("Price ($)")
         ax_p1.legend(loc="upper left", fontsize=7)
         ax_p1.grid(True, linestyle="--", alpha=0.3)
 
-        # P/S
+        # 2. Historical P/S TTM
         valid_ps = df_raw["P_S_TTM"].dropna()
         if not valid_ps.empty:
-            ax_p2.plot(xlabels[valid_ps.index], valid_ps, marker="o", linewidth=2, label="P/S (TTM)")
-
-        ax_p2.set_title("Price-to-Sales (P/S) — TTM", fontweight="bold", fontsize=10.5)
+            ax_p2.plot(xlabels[valid_ps.index], valid_ps, marker="o", linewidth=2, color="#17becf", label="Historical P/S (TTM)")
+        ax_p2.set_title("Historical Price-to-Sales (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
         ax_p2.set_ylabel("P/S Multiple (x)")
         ax_p2.tick_params(axis="x", rotation=45, labelsize=7)
         ax_p2.legend(loc="upper left", fontsize=7)
         ax_p2.grid(True, linestyle="--", alpha=0.3)
 
-        # P/E
+        # 3. Historical P/E TTM
         valid_pe = df_raw["P_E_TTM"].dropna()
         if not valid_pe.empty:
-            ax_p3.plot(xlabels[valid_pe.index], valid_pe, marker="s", linewidth=2, label="P/E (TTM)")
-            ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-
-        ax_p3.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
+            ax_p3.plot(xlabels[valid_pe.index], valid_pe, marker="s", linewidth=2, color="#bcbd22", label="Historical P/E (TTM)")
+            ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
+        ax_p3.set_title("Historical Price-to-Earnings (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
         ax_p3.set_ylabel("P/E Multiple (x)")
         ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
         ax_p3.legend(loc="upper left", fontsize=7)
         ax_p3.grid(True, linestyle="--", alpha=0.3)
 
-        # FCF yield
+        # 4. Historical FCF Yield TTM
         valid_fcfy = df_raw["FCF_Yield_%"].dropna()
         if not valid_fcfy.empty:
-            ax_p4.plot(xlabels[valid_fcfy.index], valid_fcfy, marker="^", linewidth=2, label="FCF Yield (TTM %)")
-            ax_p4.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-
-        ax_p4.set_title("Free Cash Flow Yield — TTM", fontweight="bold", fontsize=10.5)
+            ax_p4.plot(xlabels[valid_fcfy.index], valid_fcfy, marker="^", linewidth=2, color="#7f7f7f", label="Historical FCF Yield (%)")
+            ax_p4.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
+        ax_p4.set_title("Historical FCF Yield (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
         ax_p4.set_ylabel("FCF Yield (%)")
         ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
         ax_p4.legend(loc="upper left", fontsize=7)
@@ -1128,43 +898,6 @@ if run_button or ticker_symbol:
         plt.tight_layout()
         st.pyplot(fig2)
         plt.close(fig2)
-
-        # ----------------------------------------------------
-        # CHART 3: CAPEX / SHARES
-        # ----------------------------------------------------
-
-        st.markdown("---")
-        st.subheader(f"{ticker_symbol} — Capex & Share Count")
-
-        fig3, (ax_c1, ax_c2) = plt.subplots(1, 2, figsize=(16, 5), dpi=150)
-
-        ax_c1.bar(xlabels, df_raw["Capex"].abs() / 1e6, width=0.55, alpha=0.85, label="Capex ($M)")
-        ax_c1.set_title("Quarterly Capital Expenditures ($M)", fontweight="bold", fontsize=10.5)
-        ax_c1.set_ylabel("Capex ($M)")
-        ax_c1.tick_params(axis="x", rotation=45, labelsize=7)
-        ax_c1.legend(loc="upper left", fontsize=7)
-        ax_c1.grid(True, linestyle="--", alpha=0.3)
-
-        valid_dilution = df_raw["Share_Dilution_YoY_%"].dropna()
-        if not valid_dilution.empty:
-            ax_c2.plot(
-                xlabels[valid_dilution.index],
-                valid_dilution,
-                marker="o",
-                linewidth=2,
-                label="Diluted Share Growth YoY (%)",
-            )
-
-        ax_c2.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="red")
-        ax_c2.set_title("Diluted Share Count Change — YoY %", fontweight="bold", fontsize=10.5)
-        ax_c2.set_ylabel("Share Count YoY Change (%)")
-        ax_c2.tick_params(axis="x", rotation=45, labelsize=7)
-        ax_c2.legend(loc="upper left", fontsize=7)
-        ax_c2.grid(True, linestyle="--", alpha=0.3)
-
-        plt.tight_layout()
-        st.pyplot(fig3)
-        plt.close(fig3)
 
     except Exception as exc:
         st.error(f"Could not load data for ticker '{ticker_symbol}'. Error: {type(exc).__name__}: {exc}")
