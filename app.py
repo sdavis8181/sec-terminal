@@ -436,13 +436,6 @@ def pick_best_entry(candidates):
 # ============================================================
 
 def derive_quarterly_cashflows(entries, field):
-    """
-    Solves the 'Only Q1' SEC trap. U.S. 10-Q filings report YTD cash flows:
-    - Q1: ~90 days (direct)
-    - Q2: ~180 days -> Derived Q2 = 6M - Q1
-    - Q3: ~270 days -> Derived Q3 = 9M - 6M
-    - Q4: ~365 days -> Derived Q4 = FY - 9M
-    """
     usable = []
     for e in entries:
         if not entry_is_flow(e):
@@ -474,13 +467,11 @@ def derive_quarterly_cashflows(entries, field):
     derived_quarters = {}
 
     for fy, group in df_entries.groupby("fy"):
-        # Categorize flows by duration
         q1_rows = group[(group["days"] >= 70) & (group["days"] <= 110)]
         m6_rows = group[(group["days"] >= 160) & (group["days"] <= 205)]
         m9_rows = group[(group["days"] >= 250) & (group["days"] <= 300)]
         m12_rows = group[(group["days"] >= 340) & (group["days"] <= 385)]
 
-        # Q1: Direct
         if not q1_rows.empty:
             best_q1 = q1_rows.iloc[-1]
             derived_quarters[best_q1["end"].strftime("%Y-%m-%d")] = {
@@ -490,37 +481,31 @@ def derive_quarterly_cashflows(entries, field):
                 "entry": best_q1["entry"]
             }
 
-        # Q2: 6M cumulative - Q1
         if not m6_rows.empty and not q1_rows.empty:
             best_m6 = m6_rows.iloc[-1]
             best_q1 = q1_rows.iloc[-1]
-            val_q2 = best_m6["val"] - best_q1["val"]
             derived_quarters[best_m6["end"].strftime("%Y-%m-%d")] = {
-                "val": val_q2,
+                "val": best_m6["val"] - best_q1["val"],
                 "period": best_m6["end"],
                 "method": "derived (6M - Q1)",
                 "entry": best_m6["entry"]
             }
 
-        # Q3: 9M cumulative - 6M cumulative
         if not m9_rows.empty and not m6_rows.empty:
             best_m9 = m9_rows.iloc[-1]
             best_m6 = m6_rows.iloc[-1]
-            val_q3 = best_m9["val"] - best_m6["val"]
             derived_quarters[best_m9["end"].strftime("%Y-%m-%d")] = {
-                "val": val_q3,
+                "val": best_m9["val"] - best_m6["val"],
                 "period": best_m9["end"],
                 "method": "derived (9M - 6M)",
                 "entry": best_m9["entry"]
             }
 
-        # Q4: 12M annual - 9M cumulative
         if not m12_rows.empty and not m9_rows.empty:
             best_m12 = m12_rows.iloc[-1]
             best_m9 = m9_rows.iloc[-1]
-            val_q4 = best_m12["val"] - best_m9["val"]
             derived_quarters[best_m12["end"].strftime("%Y-%m-%d")] = {
-                "val": val_q4,
+                "val": best_m12["val"] - best_m9["val"],
                 "period": best_m12["end"],
                 "method": "derived (12M - 9M)",
                 "entry": best_m12["entry"]
@@ -534,10 +519,6 @@ def derive_quarterly_cashflows(entries, field):
 # ============================================================
 
 def collapse_duplicate_quarters(df, tolerance_days=45):
-    """
-    Collapses quarter entries within 45 days of each other into a single period,
-    giving preference to SEC-reported values over fallback values.
-    """
     if df.empty or "Period" not in df.columns:
         return df
 
@@ -609,7 +590,6 @@ def build_quarterly_fact_table(companyfacts):
         fact_meta[field] = meta
         entries = meta["entries"]
 
-        # If metric is OCF or Capex, derive across YTD periods to resolve the Q2-Q4 missing trap
         if field in {"OCF", "Capex"}:
             derived_map = derive_quarterly_cashflows(entries, field)
             for key, item in derived_map.items():
@@ -618,7 +598,6 @@ def build_quarterly_fact_table(companyfacts):
                 quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
                 quarter_rows[key][f"{field}_Method"] = item["method"]
 
-        # Standard processing for standalone quarterly facts (and fallback for direct cash flows)
         candidates = standalone_quarter_candidates(entries)
         grouped = {}
         for item in candidates:
@@ -636,7 +615,6 @@ def build_quarterly_fact_table(companyfacts):
             entry = best["entry"]
             quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
             
-            # Prioritize direct standalone fact if not already set by derivation
             if field not in quarter_rows[key] or pd.isna(quarter_rows[key][field]):
                 quarter_rows[key][field] = clean_number(entry.get("val"))
                 quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
@@ -769,17 +747,25 @@ def calculate_fcf(df):
 
     work["OCF"] = pd.to_numeric(work["OCF"], errors="coerce")
     work["Capex"] = pd.to_numeric(work["Capex"], errors="coerce")
-    
-    # Ad-tech/asset-light companies may report 0 or omit Capex
     work["Capex_Positive"] = work["Capex"].abs().fillna(0.0)
 
-    # Calculate FCF when OCF is available
     work["FCF"] = np.where(work["OCF"].notna(), work["OCF"] - work["Capex_Positive"], np.nan)
     work["FCF_B"] = work["FCF"] / 1e9
     work["FCF_YoY_%"] = pct_change_safe(work["FCF"], 4).clip(-500, 500)
     work["FCF_QoQ_%"] = pct_change_safe(work["FCF"], 1).clip(-500, 500)
 
     return work
+
+
+def calculate_trailing_flow(series):
+    """
+    Computes trailing 4-quarter sums. If fewer than 4 quarters are available
+    (e.g., IPOs or early records), annualizes based on available periods.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    roll_sum = s.rolling(4, min_periods=1).sum()
+    roll_count = s.rolling(4, min_periods=1).count()
+    return np.where(roll_count > 0, (roll_sum / roll_count) * 4.0, np.nan)
 
 
 # ============================================================
@@ -885,12 +871,12 @@ if run_button or ticker_symbol:
         df_fcf = calculate_fcf(df_raw)
 
         # ----------------------------------------------------
-        # TTM VALUATION
+        # TTM VALUATION (ROBUST MULTI-PERIOD ENGINE)
         # ----------------------------------------------------
 
-        df_raw["TTM_Revenue"] = df_raw["Revenue"].rolling(4).sum()
-        df_raw["TTM_EPS"] = df_raw["Diluted_EPS"].rolling(4).sum()
-        df_fcf["TTM_FCF"] = df_fcf["FCF"].rolling(4).sum()
+        df_raw["TTM_Revenue"] = calculate_trailing_flow(df_raw["Revenue"])
+        df_raw["TTM_EPS"] = calculate_trailing_flow(df_raw["Diluted_EPS"])
+        df_fcf["TTM_FCF"] = calculate_trailing_flow(df_fcf["FCF"])
 
         if pd.notna(market_cap) and market_cap > 0 and pd.notna(current_price) and current_price > 0:
             df_raw["P_S_TTM"] = safe_divide(market_cap, df_raw["TTM_Revenue"]).clip(lower=0, upper=150)
@@ -1071,8 +1057,9 @@ if run_button or ticker_symbol:
         ax_p1.grid(True, linestyle="--", alpha=0.3)
 
         # P/S
-        if "P_S_TTM" in df_raw.columns:
-            ax_p2.plot(xlabels, df_raw["P_S_TTM"], marker="o", linewidth=2, label="P/S (TTM)")
+        valid_ps = df_raw["P_S_TTM"].notna()
+        if valid_ps.any():
+            ax_p2.plot(xlabels[valid_ps], df_raw.loc[valid_ps, "P_S_TTM"], marker="o", linewidth=2, label="P/S (TTM)")
 
         ax_p2.set_title("Price-to-Sales (P/S) — TTM", fontweight="bold", fontsize=10.5)
         ax_p2.set_ylabel("P/S Multiple (x)")
@@ -1081,24 +1068,28 @@ if run_button or ticker_symbol:
         ax_p2.grid(True, linestyle="--", alpha=0.3)
 
         # P/E
-        if "P_E_TTM" in df_raw.columns:
-            ax_p3.plot(xlabels, df_raw["P_E_TTM"], marker="s", linewidth=2, label="P/E (TTM)")
+        valid_pe = df_raw["P_E_TTM"].notna()
+        if valid_pe.any():
+            ax_p3.plot(xlabels[valid_pe], df_raw.loc[valid_pe, "P_E_TTM"], marker="s", linewidth=2, label="P/E (TTM)")
             ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-            ax_p3.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
-            ax_p3.set_ylabel("P/E Multiple (x)")
-            ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
-            ax_p3.legend(loc="upper left", fontsize=7)
-            ax_p3.grid(True, linestyle="--", alpha=0.3)
+
+        ax_p3.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
+        ax_p3.set_ylabel("P/E Multiple (x)")
+        ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
+        ax_p3.legend(loc="upper left", fontsize=7)
+        ax_p3.grid(True, linestyle="--", alpha=0.3)
 
         # FCF yield
-        if "FCF_Yield_%" in df_raw.columns:
-            ax_p4.plot(xlabels, df_raw["FCF_Yield_%"], marker="^", linewidth=2, label="FCF Yield (TTM %)")
+        valid_fcfy = df_raw["FCF_Yield_%"].notna()
+        if valid_fcfy.any():
+            ax_p4.plot(xlabels[valid_fcfy], df_raw.loc[valid_fcfy, "FCF_Yield_%"], marker="^", linewidth=2, label="FCF Yield (TTM %)")
             ax_p4.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-            ax_p4.set_title("Free Cash Flow Yield — TTM", fontweight="bold", fontsize=10.5)
-            ax_p4.set_ylabel("FCF Yield (%)")
-            ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
-            ax_p4.legend(loc="upper left", fontsize=7)
-            ax_p4.grid(True, linestyle="--", alpha=0.3)
+
+        ax_p4.set_title("Free Cash Flow Yield — TTM", fontweight="bold", fontsize=10.5)
+        ax_p4.set_ylabel("FCF Yield (%)")
+        ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
+        ax_p4.legend(loc="upper left", fontsize=7)
+        ax_p4.grid(True, linestyle="--", alpha=0.3)
 
         plt.tight_layout()
         st.pyplot(fig2)
