@@ -211,6 +211,7 @@ FLOW_CONCEPTS = {
     ],
     "Operating_Income": [
         "OperatingIncomeLoss",
+        "OperatingProfitLoss",  # IFRS
         "ProfitLossFromOperatingActivities",  # IFRS
     ],
     "Net_Income": [
@@ -1247,7 +1248,7 @@ if run_button or ticker_symbol:
             f"{ticker_symbol} — Financial Performance"
         )
 
-        fig, axes = plt.subplots(
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(
             2,
             2,
             figsize=(16, 11),
@@ -1265,185 +1266,177 @@ if run_button or ticker_symbol:
             "%Y-%m-%d"
         )
 
-        # Revenue (0, 0)
-        ax = axes[0, 0]
-        valid = df_raw["Revenue_B"].notna()
-
-        if valid.any():
-            ax.bar(
-                xlabels[valid],
-                df_raw.loc[valid, "Revenue_B"],
+        # Revenue
+        valid_rev = df_raw["Revenue_B"].notna()
+        if valid_rev.any():
+            ax1.bar(
+                xlabels[valid_rev],
+                df_raw.loc[valid_rev, "Revenue_B"],
                 width=0.55,
                 alpha=0.85,
                 label="Revenue ($B)",
             )
 
-            ax.set_title(
+            ax1.set_title(
                 "Revenue ($B) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax.set_ylabel("Revenue ($B)")
-            ax.tick_params(
+            ax1.set_ylabel("Revenue ($B)")
+            ax1.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax2 = ax.twinx()
+            ax1_sub = ax1.twinx()
 
-            ax2.plot(
-                xlabels[valid],
-                df_raw.loc[valid, "Rev_YoY_%"],
+            ax1_sub.plot(
+                xlabels[valid_rev],
+                df_raw.loc[valid_rev, "Rev_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax2.plot(
-                xlabels[valid],
-                df_raw.loc[valid, "Rev_QoQ_%"],
+            ax1_sub.plot(
+                xlabels[valid_rev],
+                df_raw.loc[valid_rev, "Rev_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax2.set_ylabel("Growth (%)")
-            ax2.grid(False)
+            ax1_sub.set_ylabel("Growth (%)")
+            ax1_sub.grid(False)
 
-            h1, l1 = ax.get_legend_handles_labels()
-            h2, l2 = ax2.get_legend_handles_labels()
+            h1, l1 = ax1.get_legend_handles_labels()
+            h2, l2 = ax1_sub.get_legend_handles_labels()
 
-            ax.legend(
+            ax1.legend(
                 h1 + h2,
                 l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
-        # EPS (0, 1)
-        ax = axes
-        valid = df_raw["Diluted_EPS"].notna()
-
-        if valid.any():
-            ax.bar(
-                xlabels[valid],
-                df_raw.loc[valid, "Diluted_EPS"],
+        # EPS
+        valid_eps = df_raw["Diluted_EPS"].notna()
+        if valid_eps.any():
+            ax2.bar(
+                xlabels[valid_eps],
+                df_raw.loc[valid_eps, "Diluted_EPS"],
                 width=0.55,
                 alpha=0.85,
                 label="Diluted EPS ($)",
             )
 
-            ax.set_title(
+            ax2.set_title(
                 "Diluted EPS ($) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax.set_ylabel("EPS ($)")
-            ax.tick_params(
+            ax2.set_ylabel("EPS ($)")
+            ax2.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax2 = ax.twinx()
+            ax2_sub = ax2.twinx()
 
-            ax2.plot(
-                xlabels[valid],
-                df_raw.loc[valid, "EPS_YoY_%"],
+            ax2_sub.plot(
+                xlabels[valid_eps],
+                df_raw.loc[valid_eps, "EPS_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax2.plot(
-                xlabels[valid],
-                df_raw.loc[valid, "EPS_QoQ_%"],
+            ax2_sub.plot(
+                xlabels[valid_eps],
+                df_raw.loc[valid_eps, "EPS_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax2.set_ylabel("Growth (%)")
-            ax2.grid(False)
+            ax2_sub.set_ylabel("Growth (%)")
+            ax2_sub.grid(False)
 
-            h1, l1 = ax.get_legend_handles_labels()
-            h2, l2 = ax2.get_legend_handles_labels()
+            h1, l1 = ax2.get_legend_handles_labels()
+            h2, l2 = ax2_sub.get_legend_handles_labels()
 
-            ax.legend(
+            ax2.legend(
                 h1 + h2,
                 l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
-        # FCF (1, 0)
-        ax = axes
-        valid = df_fcf["FCF_B"].notna()
-
-        if valid.any():
+        # FCF
+        valid_fcf = df_fcf["FCF_B"].notna()
+        if valid_fcf.any():
             fcf_labels = df_fcf.loc[
-                valid, "Period"
+                valid_fcf, "Period"
             ].dt.strftime("%Y-%m-%d")
 
-            ax.bar(
+            ax3.bar(
                 fcf_labels,
-                df_fcf.loc[valid, "FCF_B"],
+                df_fcf.loc[valid_fcf, "FCF_B"],
                 width=0.55,
                 alpha=0.85,
                 label="Free Cash Flow ($B)",
             )
 
-            ax.set_title(
+            ax3.set_title(
                 "Standalone Quarterly Free Cash Flow ($B) & Growth",
                 fontweight="bold",
                 fontsize=10.5,
             )
-            ax.set_ylabel("FCF ($B)")
-            ax.tick_params(
+            ax3.set_ylabel("FCF ($B)")
+            ax3.tick_params(
                 axis="x",
                 rotation=45,
                 labelsize=7,
             )
 
-            ax2 = ax.twinx()
+            ax3_sub = ax3.twinx()
 
-            ax2.plot(
+            ax3_sub.plot(
                 fcf_labels,
-                df_fcf.loc[valid, "FCF_YoY_%"],
+                df_fcf.loc[valid_fcf, "FCF_YoY_%"],
                 marker="o",
                 linewidth=1.5,
                 label="YoY Growth (%)",
             )
 
-            ax2.plot(
+            ax3_sub.plot(
                 fcf_labels,
-                df_fcf.loc[valid, "FCF_QoQ_%"],
+                df_fcf.loc[valid_fcf, "FCF_QoQ_%"],
                 marker="s",
                 linestyle="--",
                 linewidth=1.2,
                 label="QoQ Growth (%)",
             )
 
-            ax2.set_ylabel("Growth (%)")
-            ax2.grid(False)
+            ax3_sub.set_ylabel("Growth (%)")
+            ax3_sub.grid(False)
 
-            h1, l1 = ax.get_legend_handles_labels()
-            h2, l2 = ax2.get_legend_handles_labels()
+            h1, l1 = ax3.get_legend_handles_labels()
+            h2, l2 = ax3_sub.get_legend_handles_labels()
 
-            ax.legend(
+            ax3.legend(
                 h1 + h2,
                 l1 + l2,
                 loc="upper left",
                 fontsize=6.5,
             )
 
-        # Margins (1, 1)
-        ax = axes
-
-        ax.plot(
+        # Margins
+        ax4.plot(
             xlabels,
             df_raw["Op_Margin_%"],
             marker="o",
@@ -1451,7 +1444,7 @@ if run_button or ticker_symbol:
             label="Operating Margin (%)",
         )
 
-        ax.plot(
+        ax4.plot(
             xlabels,
             df_raw["Net_Margin_%"],
             marker="s",
@@ -1460,29 +1453,29 @@ if run_button or ticker_symbol:
             label="Net Margin (%)",
         )
 
-        ax.axhline(
+        ax4.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax.set_title(
+        ax4.set_title(
             "Operating Margin vs. Net Margin (%)",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("Margin (%)")
-        ax.tick_params(
+        ax4.set_ylabel("Margin (%)")
+        ax4.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax4.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax4.grid(
             True,
             linestyle="--",
             alpha=0.3,
@@ -1502,7 +1495,7 @@ if run_button or ticker_symbol:
             f"{ticker_symbol} — Valuation & Price Action"
         )
 
-        fig2, axes2 = plt.subplots(
+        fig2, ((ax_p1, ax_p2), (ax_p3, ax_p4)) = plt.subplots(
             2,
             2,
             figsize=(16, 11),
@@ -1516,28 +1509,26 @@ if run_button or ticker_symbol:
             y=0.98,
         )
 
-        # Price (0, 0)
-        ax = axes2[0, 0]
-
+        # Price
         if (
             hist_price is not None
             and not hist_price.empty
         ):
-            ax.plot(
+            ax_p1.plot(
                 hist_price.index,
                 hist_price["Close"],
                 linewidth=1.5,
                 label="Close Price ($)",
             )
 
-            ax.plot(
+            ax_p1.plot(
                 hist_price.index,
                 hist_price["EMA50"],
                 linewidth=1.2,
                 label="50-Day EMA",
             )
 
-            ax.plot(
+            ax_p1.plot(
                 hist_price.index,
                 hist_price["EMA200"],
                 linestyle="--",
@@ -1545,27 +1536,25 @@ if run_button or ticker_symbol:
                 label="200-Day EMA",
             )
 
-        ax.set_title(
+        ax_p1.set_title(
             "Daily Stock Price vs 50/200 EMA",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("Price ($)")
-        ax.legend(
+        ax_p1.set_ylabel("Price ($)")
+        ax_p1.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_p1.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        # P/S (0, 1)
-        ax = axes2
-
+        # P/S
         if "P_S_TTM" in df_raw.columns:
-            ax.plot(
+            ax_p2.plot(
                 xlabels,
                 df_raw["P_S_TTM"],
                 marker="o",
@@ -1573,32 +1562,30 @@ if run_button or ticker_symbol:
                 label="P/S (TTM)",
             )
 
-        ax.set_title(
+        ax_p2.set_title(
             "Price-to-Sales (P/S) — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("P/S Multiple (x)")
-        ax.tick_params(
+        ax_p2.set_ylabel("P/S Multiple (x)")
+        ax_p2.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax_p2.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_p2.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        # P/E (1, 0)
-        ax = axes2
-
+        # P/E
         if "P_E_TTM" in df_raw.columns:
-            ax.plot(
+            ax_p3.plot(
                 xlabels,
                 df_raw["P_E_TTM"],
                 marker="s",
@@ -1606,39 +1593,37 @@ if run_button or ticker_symbol:
                 label="P/E (TTM)",
             )
 
-        ax.axhline(
+        ax_p3.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax.set_title(
+        ax_p3.set_title(
             "Price-to-Earnings (P/E) — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("P/E Multiple (x)")
-        ax.tick_params(
+        ax_p3.set_ylabel("P/E Multiple (x)")
+        ax_p3.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax_p3.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_p3.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        # FCF yield (1, 1)
-        ax = axes2
-
+        # FCF yield
         if "FCF_Yield_%" in df_raw.columns:
-            ax.plot(
+            ax_p4.plot(
                 xlabels,
                 df_raw["FCF_Yield_%"],
                 marker="^",
@@ -1646,29 +1631,29 @@ if run_button or ticker_symbol:
                 label="FCF Yield (TTM %)",
             )
 
-        ax.axhline(
+        ax_p4.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax.set_title(
+        ax_p4.set_title(
             "Free Cash Flow Yield — TTM",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("FCF Yield (%)")
-        ax.tick_params(
+        ax_p4.set_ylabel("FCF Yield (%)")
+        ax_p4.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax_p4.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_p4.grid(
             True,
             linestyle="--",
             alpha=0.3,
@@ -1688,16 +1673,14 @@ if run_button or ticker_symbol:
             f"{ticker_symbol} — Capex & Share Count"
         )
 
-        fig3, axes3 = plt.subplots(
+        fig3, (ax_c1, ax_c2) = plt.subplots(
             1,
             2,
             figsize=(16, 5),
             dpi=150,
         )
 
-        ax = axes3[0]
-
-        ax.bar(
+        ax_c1.bar(
             xlabels,
             df_raw["Capex"].abs() / 1e9,
             width=0.55,
@@ -1705,30 +1688,28 @@ if run_button or ticker_symbol:
             label="Capex ($B)",
         )
 
-        ax.set_title(
+        ax_c1.set_title(
             "Quarterly Capital Expenditures ($B)",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("Capex ($B)")
-        ax.tick_params(
+        ax_c1.set_ylabel("Capex ($B)")
+        ax_c1.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax_c1.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_c1.grid(
             True,
             linestyle="--",
             alpha=0.3,
         )
 
-        ax = axes3
-
-        ax.plot(
+        ax_c2.plot(
             xlabels,
             df_raw["Share_Dilution_YoY_%"],
             marker="o",
@@ -1736,29 +1717,29 @@ if run_button or ticker_symbol:
             label="Diluted Share Growth YoY (%)",
         )
 
-        ax.axhline(
+        ax_c2.axhline(
             0,
             linestyle=":",
             linewidth=1,
             alpha=0.6,
         )
 
-        ax.set_title(
+        ax_c2.set_title(
             "Diluted Share Count Change — YoY %",
             fontweight="bold",
             fontsize=10.5,
         )
-        ax.set_ylabel("Share Count YoY Change (%)")
-        ax.tick_params(
+        ax_c2.set_ylabel("Share Count YoY Change (%)")
+        ax_c2.tick_params(
             axis="x",
             rotation=45,
             labelsize=7,
         )
-        ax.legend(
+        ax_c2.legend(
             loc="upper left",
             fontsize=7,
         )
-        ax.grid(
+        ax_c2.grid(
             True,
             linestyle="--",
             alpha=0.3,
@@ -1771,7 +1752,7 @@ if run_button or ticker_symbol:
 
     except Exception as exc:
         st.error(
-            f"Could not load data for ticker '{ticker_symbol}. "
+            f"Could not load data for ticker '{ticker_symbol}'. "
             f"Error: {type(exc).__name__}: {exc}"
         )
         st.exception(exc)
