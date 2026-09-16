@@ -242,36 +242,6 @@ FLOW_CONCEPTS = {
     ],
 }
 
-LABEL_FALLBACKS = {
-    "Revenue": [
-        "revenue",
-        "sales",
-    ],
-    "Operating_Income": [
-        "operating profit",
-        "operating income",
-    ],
-    "Net_Income": [
-        "profit loss",
-        "profit for the period",
-        "net income",
-    ],
-    "Diluted_EPS": [
-        "diluted earnings per share",
-    ],
-    "Diluted_Shares": [
-        "weighted average number of diluted shares",
-    ],
-    "OCF": [
-        "cash flows from operating activities",
-        "net cash from operating activities",
-    ],
-    "Capex": [
-        "purchase of property plant and equipment",
-        "payments to acquire property plant and equipment",
-    ],
-}
-
 FLOW_FIELDS = [
     "Revenue",
     "Operating_Income",
@@ -446,25 +416,6 @@ def standalone_quarter_candidates(entries):
                     "score": score,
                 }
             )
-
-    return output
-
-
-def annual_candidates(entries):
-    output = []
-
-    for e in entries:
-        if not entry_is_flow(e):
-            continue
-
-        days = entry_duration_days(e)
-        if days is None:
-            continue
-
-        form = str(e.get("form", "")).upper()
-
-        if 320 <= days <= 390 and form in {"10-K", "20-F"}:
-            output.append(e)
 
     return output
 
@@ -672,6 +623,11 @@ def fetch_yahoo_quarterly(ticker):
 
 
 def merge_sec_yahoo(sec_df, yahoo_df):
+    """
+    SEC is authoritative. Off-calendar quarter dates within 35 days
+    (e.g., 2024-03-31 from Yahoo and 2024-04-30 from SEC) are snapped
+    together to prevent duplicate alternating quarters.
+    """
     if sec_df.empty:
         return yahoo_df.copy()
 
@@ -700,6 +656,20 @@ def merge_sec_yahoo(sec_df, yahoo_df):
 
     sec["Period"] = pd.to_datetime(sec["Period"], errors="coerce")
     yf_df["Period"] = pd.to_datetime(yf_df["Period"], errors="coerce")
+
+    # Date snap: Match Yahoo date to SEC date if within 35 days
+    sec_periods = sorted(sec["Period"].dropna().unique())
+    aligned_yf_dates = []
+
+    for yf_date in yf_df["Period"]:
+        snapped = yf_date
+        for s_date in sec_periods:
+            if abs((yf_date - s_date).days) <= 35:
+                snapped = s_date
+                break
+        aligned_yf_dates.append(snapped)
+
+    yf_df["Period"] = aligned_yf_dates
 
     sec_indexed = sec.set_index("Period")
     yf_indexed = yf_df.set_index("Period")
