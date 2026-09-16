@@ -234,6 +234,18 @@ FLOW_CONCEPTS = {
         "PaymentsForSoftware",
         "PaymentsToAcquireIntangibleAssets",
     ],
+    # --- Added for ROIC: pretax income & tax expense are duration (flow)
+    # facts just like Revenue/OCF, so they ride the exact same extraction,
+    # Q4-derivation, canonicalization and reindexing pipeline as everything else.
+    "Pretax_Income": [
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+    ],
+    "Income_Tax_Expense": [
+        "IncomeTaxExpenseBenefit",
+        "IncomeTaxExpenseBenefitContinuingOperations",
+    ],
 }
 
 FLOW_FIELDS = [
@@ -244,7 +256,37 @@ FLOW_FIELDS = [
     "Diluted_Shares",
     "OCF",
     "Capex",
+    "Pretax_Income",
+    "Income_Tax_Expense",
 ]
+
+# Balance-sheet (instant, point-in-time) concepts used for Invested Capital.
+# These are NOT duration facts, so they need their own lightweight extraction
+# path (see get_instant_entries / build_balance_sheet_table below) rather than
+# the Q1/6M/9M/12M subtraction logic used for flow facts.
+BALANCE_CONCEPTS = {
+    "Total_Equity": [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
+    "Long_Term_Debt": [
+        "LongTermDebtNoncurrent",
+        "LongTermDebt",
+        "LongTermNotesPayable",
+    ],
+    "Short_Term_Debt": [
+        "LongTermDebtCurrent",
+        "DebtCurrent",
+        "ShortTermBorrowings",
+        "NotesPayableCurrent",
+    ],
+    "Cash": [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CashAndCashEquivalentsAtCarryingValueIncludingDiscontinuedOperations",
+    ],
+}
+BALANCE_FIELDS = ["Total_Equity", "Long_Term_Debt", "Short_Term_Debt", "Cash"]
 
 
 # ============================================================
@@ -581,7 +623,7 @@ def build_quarterly_fact_table(companyfacts):
             quarter_rows[canon_key][f"{field}_Method"] = best["method"]
 
         # Step 2: Backfill missing quarters (e.g., Q4 or cumulative filers) via flow derivation
-        if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
+        if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income", "Pretax_Income", "Income_Tax_Expense"}:
             derived_map = derive_quarterly_flows(entries, field)
             for key, item in derived_map.items():
                 quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
@@ -597,6 +639,70 @@ def build_quarterly_fact_table(companyfacts):
     df = collapse_duplicate_quarters(df, tolerance_days=45)
     df = df[df["Period"] >= pd.Timestamp("2017-01-01")].reset_index(drop=True)
     return df, fact_meta
+
+
+def get_instant_entries(companyfacts, field):
+    """
+    Like get_all_usable_entries, but for balance-sheet ("instant") facts,
+    which only have an "end" date (a snapshot), never a "start"/duration.
+    """
+    facts = companyfacts.get("facts", {})
+    preferred = BALANCE_CONCEPTS.get(field, [])
+    all_entries = []
+
+    for taxonomy, taxonomy_facts in facts.items():
+        if not isinstance(taxonomy_facts, dict):
+            continue
+        for concept in preferred:
+            if concept not in taxonomy_facts:
+                continue
+            concept_data = taxonomy_facts[concept]
+            unit = choose_unit_name(concept_data, field) or "USD"
+            entries = concept_data.get("units", {}).get(unit, [])
+            for e in entries:
+                if isinstance(e, dict) and "val" in e and "end" in e and "start" not in e:
+                    all_entries.append(dict(e, taxonomy=taxonomy, concept=concept, unit=unit))
+
+    return all_entries
+
+
+def build_balance_sheet_table(companyfacts):
+    """
+    Builds a quarter-indexed table of instant balance-sheet items (equity,
+    debt, cash) used to compute Invested Capital for the ROIC chart.
+    """
+    rows = {}
+    meta = {}
+
+    for field in BALANCE_FIELDS:
+        entries = get_instant_entries(companyfacts, field)
+        if not entries:
+            meta[field] = None
+            continue
+
+        meta[field] = {
+            "taxonomy": entries[0]["taxonomy"],
+            "concept": entries[0]["concept"],
+            "unit": entries[0]["unit"],
+        }
+
+        grouped = {}
+        for e in entries:
+            end = entry_date(e, "end")
+            if pd.isna(end):
+                continue
+            key = canonical_quarter_end(end).strftime("%Y-%m-%d")
+            grouped.setdefault(key, []).append(e)
+
+        for key, group in grouped.items():
+            best = sorted(group, key=lambda x: (str(x.get("filed", "")), str(x.get("accn", ""))))[-1]
+            canon_period = canonical_quarter_end(entry_date(best, "end"))
+            rows.setdefault(key, {"Period": canon_period})
+            rows[key][field] = clean_number(best.get("val"))
+            rows[key][f"{field}_Concept"] = f"{best.get('taxonomy')}:{best.get('concept')}"
+
+    df = pd.DataFrame(list(rows.values()))
+    return df, meta
 
 
 YF_KEYS = {
@@ -668,6 +774,18 @@ def calculate_metrics(df):
         & (implied_shares > 0)
     )
     work.loc[missing_shares, "Diluted_Shares"] = implied_shares[missing_shares]
+
+    # Invested Capital components (instant balance-sheet facts merged in by
+    # fetch_and_parse_ticker). Kept as plain per-quarter snapshots here; the
+    # TTM/NOPAT/ROIC math happens later in main() alongside the other
+    # TTM-dependent valuation metrics (P/E, P/S, FCF yield), for consistency.
+    for col in BALANCE_FIELDS:
+        if col not in work.columns:
+            work[col] = np.nan
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work["Total_Debt"] = work[["Long_Term_Debt", "Short_Term_Debt"]].sum(axis=1, min_count=1)
+    work["Invested_Capital"] = work["Total_Debt"].fillna(0) + work["Total_Equity"] - work["Cash"].fillna(0)
 
     work["Diluted_Shares_M"] = work["Diluted_Shares"].replace(0, np.nan).ffill().bfill() / 1e6
     work["Revenue_B"] = work["Revenue"] / 1e9
@@ -761,6 +879,18 @@ def fetch_and_parse_ticker(ticker, refresh_nonce=0):
     # Snap onto a gap-explicit quarterly calendar BEFORE any YoY/TTM math is
     # computed, so pct_change/rolling never silently bridge a missing quarter.
     df = reindex_to_quarterly(df)
+
+    # Merge in instant balance-sheet facts (equity/debt/cash) for ROIC. Both
+    # sides are already on the canonical quarter-end grid, so this is a
+    # straightforward left-merge on Period.
+    balance_df, balance_meta = build_balance_sheet_table(companyfacts)
+    if not balance_df.empty:
+        df = df.merge(balance_df, on="Period", how="left")
+    for field, info in balance_meta.items():
+        fact_meta[field] = info
+    if all(v is None for v in balance_meta.values()):
+        diagnostics.append("No balance-sheet (equity/debt/cash) facts found - ROIC will be unavailable.")
+
     df = calculate_metrics(df)
 
     return df, fact_meta, diagnostics
@@ -802,6 +932,31 @@ if ticker_symbol:
         df_raw["FCF_Yield_%"] = (safe_divide(df_raw["TTM_FCF"], implied_hist_cap) * 100).clip(-50, 100)
 
         # ----------------------------------------------------
+        # ROIC (Return on Invested Capital)
+        # NOPAT (TTM) = TTM Operating Income x (1 - effective tax rate)
+        # Effective tax rate = TTM Income Tax Expense / TTM Pretax Income,
+        # falling back to a flat 21% statutory rate when tax facts aren't
+        # available or pretax income is <= 0 (rate would be meaningless).
+        # Invested Capital = Total Debt + Total Equity - Cash, averaged
+        # between the start and end of the trailing-twelve-month window.
+        # ----------------------------------------------------
+        df_raw["TTM_Operating_Income"] = calculate_trailing_flow_strict(df_raw["Operating_Income"])
+        df_raw["TTM_Pretax_Income"] = calculate_trailing_flow_strict(df_raw["Pretax_Income"])
+        df_raw["TTM_Income_Tax_Expense"] = calculate_trailing_flow_strict(df_raw["Income_Tax_Expense"])
+
+        eff_tax_rate = safe_divide(df_raw["TTM_Income_Tax_Expense"], df_raw["TTM_Pretax_Income"])
+        eff_tax_rate = eff_tax_rate.where(df_raw["TTM_Pretax_Income"] > 0).clip(0, 0.6)
+        eff_tax_rate = eff_tax_rate.fillna(0.21)
+
+        df_raw["NOPAT_TTM"] = df_raw["TTM_Operating_Income"] * (1 - eff_tax_rate)
+
+        df_raw["Invested_Capital_Avg"] = (df_raw["Invested_Capital"] + df_raw["Invested_Capital"].shift(4)) / 2
+        df_raw["Invested_Capital_Avg"] = df_raw["Invested_Capital_Avg"].fillna(df_raw["Invested_Capital"])
+
+        df_raw["ROIC_%"] = safe_divide(df_raw["NOPAT_TTM"], df_raw["Invested_Capital_Avg"]) * 100
+        df_raw["ROIC_%"] = df_raw["ROIC_%"].where(df_raw["Invested_Capital_Avg"] > 0).clip(-100, 100)
+
+        # ----------------------------------------------------
         # DASHBOARD HEADER
         # ----------------------------------------------------
         st.subheader(f"{ticker_symbol} — Executive Financial Dashboard")
@@ -841,199 +996,203 @@ if ticker_symbol:
                 "Period", "Source", "Revenue_B", "Rev_YoY_%", "Diluted_EPS", "EPS_YoY_%",
                 "Operating_Income", "Op_Margin_%", "Net_Income", "Net_Margin_%",
                 "OCF", "Capex", "FCF_B", "Diluted_Shares_M", "Share_Dilution_YoY_%",
+                "Total_Equity", "Total_Debt", "Cash", "Invested_Capital",
             ]
             st.dataframe(display[[c for c in display_cols if c in display.columns]], use_container_width=True)
 
         # ----------------------------------------------------
-        # CHARTS: FINANCIAL PERFORMANCE
+        # Shared helper for the "bar + secondary-axis line" chart style
+        # used throughout every row below.
         # ----------------------------------------------------
-        st.markdown("---")
-        st.subheader(f"{ticker_symbol} — Financial Performance")
-
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
-        fig.suptitle(f"{ticker_symbol} Operational & Flow Fundamentals", fontsize=14, fontweight="bold", y=0.98)
         xlabels = df_raw["Period"].dt.strftime("%Y-%m-%d")
 
-        # 1. Revenue
-        if df_raw["Revenue_B"].notna().any():
-            ax1.bar(xlabels, df_raw["Revenue_B"], width=0.55, alpha=0.85, label="Revenue ($B)", color="#1f77b4")
-            ax1.set_title("Revenue ($B) & YoY Growth", fontweight="bold", fontsize=10.5)
-            ax1.set_ylabel("Revenue ($B)")
-            ax1.tick_params(axis="x", rotation=45, labelsize=7)
+        def bar_with_growth(ax, values, growth, bar_label, growth_label, bar_color, line_color, title, ylabel):
+            if values.notna().any():
+                ax.bar(xlabels, values, width=0.55, alpha=0.85, label=bar_label, color=bar_color)
+                ax.set_title(title, fontweight="bold", fontsize=10.5)
+                ax.set_ylabel(ylabel)
+                ax.tick_params(axis="x", rotation=45, labelsize=7)
 
-            ax1_sub = ax1.twinx()
-            yoy_rev = df_raw["Rev_YoY_%"].dropna()
-            if not yoy_rev.empty:
-                ax1_sub.plot(xlabels[yoy_rev.index], yoy_rev, marker="o", color="#ff7f0e", linewidth=1.5, label="YoY Growth (%)")
-            ax1_sub.set_ylabel("Growth (%)")
-            ax1_sub.grid(False)
+                ax_sub = ax.twinx()
+                g = growth.dropna()
+                if not g.empty:
+                    ax_sub.plot(xlabels[g.index], g, marker="o", color=line_color, linewidth=1.5, label=growth_label)
+                ax_sub.set_ylabel("Growth (%)")
+                ax_sub.grid(False)
 
-            h1, l1 = ax1.get_legend_handles_labels()
-            h2, l2 = ax1_sub.get_legend_handles_labels()
-            ax1.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+                h1, l1 = ax.get_legend_handles_labels()
+                h2, l2 = ax_sub.get_legend_handles_labels()
+                ax.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+            else:
+                ax.set_title(title, fontweight="bold", fontsize=10.5)
+                ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes, fontsize=9, color="gray")
 
-        # 2. EPS
-        if df_raw["Diluted_EPS"].notna().any():
-            ax2.bar(xlabels, df_raw["Diluted_EPS"], width=0.55, alpha=0.85, label="Diluted EPS ($)", color="#2ca02c")
-            ax2.set_title("Diluted EPS ($) & YoY Growth", fontweight="bold", fontsize=10.5)
-            ax2.set_ylabel("EPS ($)")
-            ax2.tick_params(axis="x", rotation=45, labelsize=7)
+        def line_chart(ax, values, label, color, title, ylabel, marker="o", zero_line=False):
+            v = values.dropna()
+            if not v.empty:
+                ax.plot(xlabels[v.index], v, marker=marker, linewidth=2, color=color, label=label)
+                if zero_line:
+                    ax.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
+                ax.legend(loc="upper left", fontsize=7)
+            else:
+                ax.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax.transAxes, fontsize=9, color="gray")
+            ax.set_title(title, fontweight="bold", fontsize=10.5)
+            ax.set_ylabel(ylabel)
+            ax.tick_params(axis="x", rotation=45, labelsize=7)
+            ax.grid(True, linestyle="--", alpha=0.3)
 
-            ax2_sub = ax2.twinx()
-            yoy_eps = df_raw["EPS_YoY_%"].dropna()
-            if not yoy_eps.empty:
-                ax2_sub.plot(xlabels[yoy_eps.index], yoy_eps, marker="o", color="#d62728", linewidth=1.5, label="YoY Growth (%)")
-            ax2_sub.set_ylabel("Growth (%)")
-            ax2_sub.grid(False)
-
-            h1, l1 = ax2.get_legend_handles_labels()
-            h2, l2 = ax2_sub.get_legend_handles_labels()
-            ax2.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
-
-        # 3. FCF
-        if df_raw["FCF_B"].notna().any():
-            ax3.bar(xlabels, df_raw["FCF_B"], width=0.55, alpha=0.85, label="Free Cash Flow ($B)", color="#9467bd")
-            ax3.set_title("Standalone Free Cash Flow ($B) & YoY Growth", fontweight="bold", fontsize=10.5)
-            ax3.set_ylabel("FCF ($B)")
-            ax3.tick_params(axis="x", rotation=45, labelsize=7)
-
-            ax3_sub = ax3.twinx()
-            yoy_fcf = df_raw["FCF_YoY_%"].dropna()
-            if not yoy_fcf.empty:
-                ax3_sub.plot(xlabels[yoy_fcf.index], yoy_fcf, marker="o", color="#8c564b", linewidth=1.5, label="YoY Growth (%)")
-            ax3_sub.set_ylabel("Growth (%)")
-            ax3_sub.grid(False)
-
-            h1, l1 = ax3.get_legend_handles_labels()
-            h2, l2 = ax3_sub.get_legend_handles_labels()
-            ax3.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
-
-        # 4. Margins
-        valid_op = df_raw["Op_Margin_%"].dropna()
-        valid_net = df_raw["Net_Margin_%"].dropna()
-        if not valid_op.empty:
-            ax4.plot(xlabels[valid_op.index], valid_op, marker="o", linewidth=2, label="Operating Margin (%)", color="#1f77b4")
-        if not valid_net.empty:
-            ax4.plot(xlabels[valid_net.index], valid_net, marker="s", linestyle="--", linewidth=2, label="Net Margin (%)", color="#2ca02c")
-
-        ax4.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
-        ax4.set_title("Operating Margin vs Net Margin (%)", fontweight="bold", fontsize=10.5)
-        ax4.set_ylabel("Margin (%)")
-        ax4.tick_params(axis="x", rotation=45, labelsize=7)
-        ax4.legend(loc="upper left", fontsize=7)
-        ax4.grid(True, linestyle="--", alpha=0.3)
-
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-        # ----------------------------------------------------
-        # CHARTS: HISTORICAL VALUATION & PRICE
-        # ----------------------------------------------------
         st.markdown("---")
-        st.subheader(f"{ticker_symbol} — Historical Valuation & Price Action")
 
-        fig2, ((ax_p1, ax_p2), (ax_p3, ax_p4)) = plt.subplots(2, 2, figsize=(16, 11), dpi=150)
-        fig2.suptitle(f"{ticker_symbol} As-Of Period Valuation (Non-Distorted)", fontsize=14, fontweight="bold", y=0.98)
+        # ======================================================
+        # ROW 1 — Stock Price (EMAs) & Margins
+        # ======================================================
+        st.subheader(f"{ticker_symbol} — Price Action & Margins")
+        fig1, (ax_price, ax_margin) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
 
-        # 1. Daily Price & EMAs (Last 2 Years)
         if hist_price is not None and not hist_price.empty:
             two_years_ago = hist_price.index.max() - pd.DateOffset(years=2)
             recent_hist = hist_price[hist_price.index >= two_years_ago]
-            ax_p1.plot(recent_hist.index, recent_hist["Close"], linewidth=1.5, label="Close Price ($)", color="black")
-            ax_p1.plot(recent_hist.index, recent_hist["EMA50"], linewidth=1.2, label="50-Day EMA", color="#1f77b4")
-            ax_p1.plot(recent_hist.index, recent_hist["EMA200"], linestyle="--", linewidth=1.2, label="200-Day EMA", color="#d62728")
+            ax_price.plot(recent_hist.index, recent_hist["Close"], linewidth=1.5, label="Close Price ($)", color="black")
+            ax_price.plot(recent_hist.index, recent_hist["EMA50"], linewidth=1.2, label="50-Day EMA", color="#1f77b4")
+            ax_price.plot(recent_hist.index, recent_hist["EMA200"], linestyle="--", linewidth=1.2, label="200-Day EMA", color="#d62728")
+            ax_price.legend(loc="upper left", fontsize=7)
+        else:
+            ax_price.text(0.5, 0.5, "No price data available", ha="center", va="center", transform=ax_price.transAxes, fontsize=9, color="gray")
+        ax_price.set_title("Daily Stock Price vs 50/200 EMA (2-Year)", fontweight="bold", fontsize=10.5)
+        ax_price.set_ylabel("Price ($)")
+        ax_price.grid(True, linestyle="--", alpha=0.3)
 
-        ax_p1.set_title("Daily Stock Price vs 50/200 EMA (2-Year)", fontweight="bold", fontsize=10.5)
-        ax_p1.set_ylabel("Price ($)")
-        ax_p1.legend(loc="upper left", fontsize=7)
-        ax_p1.grid(True, linestyle="--", alpha=0.3)
+        valid_op = df_raw["Op_Margin_%"].dropna()
+        valid_net = df_raw["Net_Margin_%"].dropna()
+        if not valid_op.empty:
+            ax_margin.plot(xlabels[valid_op.index], valid_op, marker="o", linewidth=2, label="Operating Margin (%)", color="#1f77b4")
+        if not valid_net.empty:
+            ax_margin.plot(xlabels[valid_net.index], valid_net, marker="s", linestyle="--", linewidth=2, label="Net Margin (%)", color="#2ca02c")
+        if valid_op.empty and valid_net.empty:
+            ax_margin.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax_margin.transAxes, fontsize=9, color="gray")
+        ax_margin.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
+        ax_margin.set_title("Operating Margin vs Net Margin (%)", fontweight="bold", fontsize=10.5)
+        ax_margin.set_ylabel("Margin (%)")
+        ax_margin.tick_params(axis="x", rotation=45, labelsize=7)
+        ax_margin.legend(loc="upper left", fontsize=7)
+        ax_margin.grid(True, linestyle="--", alpha=0.3)
 
-        # 2. Historical P/S TTM
-        valid_ps = df_raw["P_S_TTM"].dropna()
-        if not valid_ps.empty:
-            ax_p2.plot(xlabels[valid_ps.index], valid_ps, marker="o", linewidth=2, color="#17becf", label="Historical P/S (TTM)")
-        ax_p2.set_title("Historical Price-to-Sales (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
-        ax_p2.set_ylabel("P/S Multiple (x)")
-        ax_p2.tick_params(axis="x", rotation=45, labelsize=7)
-        ax_p2.legend(loc="upper left", fontsize=7)
-        ax_p2.grid(True, linestyle="--", alpha=0.3)
+        plt.tight_layout()
+        st.pyplot(fig1)
+        plt.close(fig1)
 
-        # 3. Historical P/E TTM
-        valid_pe = df_raw["P_E_TTM"].dropna()
-        if not valid_pe.empty:
-            ax_p3.plot(xlabels[valid_pe.index], valid_pe, marker="s", linewidth=2, color="#bcbd22", label="Historical P/E (TTM)")
-            ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
-        ax_p3.set_title("Historical Price-to-Earnings (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
-        ax_p3.set_ylabel("P/E Multiple (x)")
-        ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
-        ax_p3.legend(loc="upper left", fontsize=7)
-        ax_p3.grid(True, linestyle="--", alpha=0.3)
+        # ======================================================
+        # ROW 2 — Revenue & Earnings Growth
+        # ======================================================
+        st.markdown("---")
+        st.subheader(f"{ticker_symbol} — Revenue & Earnings Growth")
+        fig2, (ax_rev, ax_eps) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
 
-        # 4. Historical FCF Yield TTM
-        valid_fcfy = df_raw["FCF_Yield_%"].dropna()
-        if not valid_fcfy.empty:
-            ax_p4.plot(xlabels[valid_fcfy.index], valid_fcfy, marker="^", linewidth=2, color="#7f7f7f", label="Historical FCF Yield (%)")
-            ax_p4.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="gray")
-        ax_p4.set_title("Historical FCF Yield (TTM as-of Quarter)", fontweight="bold", fontsize=10.5)
-        ax_p4.set_ylabel("FCF Yield (%)")
-        ax_p4.tick_params(axis="x", rotation=45, labelsize=7)
-        ax_p4.legend(loc="upper left", fontsize=7)
-        ax_p4.grid(True, linestyle="--", alpha=0.3)
+        bar_with_growth(ax_rev, df_raw["Revenue_B"], df_raw["Rev_YoY_%"], "Revenue ($B)", "YoY Growth (%)",
+                         "#1f77b4", "#ff7f0e", "Revenue ($B) & YoY Growth", "Revenue ($B)")
+        bar_with_growth(ax_eps, df_raw["Diluted_EPS"], df_raw["EPS_YoY_%"], "Diluted EPS ($)", "YoY Growth (%)",
+                         "#2ca02c", "#d62728", "Diluted EPS ($) & YoY Growth", "EPS ($)")
 
         plt.tight_layout()
         st.pyplot(fig2)
         plt.close(fig2)
 
-        # ----------------------------------------------------
-        # CHARTS: CAPITAL STRUCTURE — SHARES & CAPEX (re-added)
-        # ----------------------------------------------------
+        # ======================================================
+        # ROW 3 — P/S & P/E
+        # ======================================================
         st.markdown("---")
-        st.subheader(f"{ticker_symbol} — Capital Structure & Investment")
+        st.subheader(f"{ticker_symbol} — Valuation Multiples")
+        fig3, (ax_ps, ax_pe) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
 
-        fig3, (ax5, ax6) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
-        fig3.suptitle(f"{ticker_symbol} Share Count & Capital Expenditure", fontsize=14, fontweight="bold", y=1.03)
-
-        # 5. Diluted Shares Outstanding & YoY Dilution
-        if df_raw["Diluted_Shares_M"].notna().any():
-            ax5.bar(xlabels, df_raw["Diluted_Shares_M"], width=0.55, alpha=0.85, label="Diluted Shares (M)", color="#e377c2")
-            ax5.set_title("Diluted Shares Outstanding (M) & YoY Dilution", fontweight="bold", fontsize=10.5)
-            ax5.set_ylabel("Shares (Millions)")
-            ax5.tick_params(axis="x", rotation=45, labelsize=7)
-
-            ax5_sub = ax5.twinx()
-            yoy_dil = df_raw["Share_Dilution_YoY_%"].dropna()
-            if not yoy_dil.empty:
-                ax5_sub.plot(xlabels[yoy_dil.index], yoy_dil, marker="o", color="#17becf", linewidth=1.5, label="YoY Dilution (%)")
-            ax5_sub.set_ylabel("Dilution (%)")
-            ax5_sub.grid(False)
-
-            h1, l1 = ax5.get_legend_handles_labels()
-            h2, l2 = ax5_sub.get_legend_handles_labels()
-            ax5.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
-
-        # 6. Capex & YoY Growth
-        if df_raw["Capex_Positive"].notna().any():
-            capex_m = df_raw["Capex_Positive"] / 1e6
-            ax6.bar(xlabels, capex_m, width=0.55, alpha=0.85, label="Capex ($M)", color="#8c564b")
-            ax6.set_title("Capital Expenditure ($M) & YoY Growth", fontweight="bold", fontsize=10.5)
-            ax6.set_ylabel("Capex ($M)")
-            ax6.tick_params(axis="x", rotation=45, labelsize=7)
-
-            ax6_sub = ax6.twinx()
-            capex_yoy = pct_change_safe(df_raw["Capex_Positive"], 4).clip(-500, 500).dropna()
-            if not capex_yoy.empty:
-                ax6_sub.plot(xlabels[capex_yoy.index], capex_yoy, marker="o", color="#bcbd22", linewidth=1.5, label="YoY Growth (%)")
-            ax6_sub.set_ylabel("Growth (%)")
-            ax6_sub.grid(False)
-
-            h1, l1 = ax6.get_legend_handles_labels()
-            h2, l2 = ax6_sub.get_legend_handles_labels()
-            ax6.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+        line_chart(ax_ps, df_raw["P_S_TTM"], "Historical P/S (TTM)", "#17becf",
+                   "Historical Price-to-Sales (TTM as-of Quarter)", "P/S Multiple (x)")
+        line_chart(ax_pe, df_raw["P_E_TTM"], "Historical P/E (TTM)", "#bcbd22",
+                   "Historical Price-to-Earnings (TTM as-of Quarter)", "P/E Multiple (x)",
+                   marker="s", zero_line=True)
 
         plt.tight_layout()
         st.pyplot(fig3)
         plt.close(fig3)
+
+        # ======================================================
+        # ROW 4 — FCF Growth & FCF Yield
+        # ======================================================
+        st.markdown("---")
+        st.subheader(f"{ticker_symbol} — Free Cash Flow")
+        fig4, (ax_fcf, ax_fcfy) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
+
+        bar_with_growth(ax_fcf, df_raw["FCF_B"], df_raw["FCF_YoY_%"], "Free Cash Flow ($B)", "YoY Growth (%)",
+                         "#9467bd", "#8c564b", "Standalone Free Cash Flow ($B) & YoY Growth", "FCF ($B)")
+        line_chart(ax_fcfy, df_raw["FCF_Yield_%"], "Historical FCF Yield (%)", "#7f7f7f",
+                   "Historical FCF Yield (TTM as-of Quarter)", "FCF Yield (%)",
+                   marker="^", zero_line=True)
+
+        plt.tight_layout()
+        st.pyplot(fig4)
+        plt.close(fig4)
+
+        # ======================================================
+        # ROW 5 — Capex & Shares Outstanding
+        # ======================================================
+        st.markdown("---")
+        st.subheader(f"{ticker_symbol} — Capital Structure & Investment")
+        fig5, (ax_capex, ax_shares) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
+
+        capex_m = df_raw["Capex_Positive"] / 1e6
+        capex_yoy = pct_change_safe(df_raw["Capex_Positive"], 4).clip(-500, 500)
+        bar_with_growth(ax_capex, capex_m, capex_yoy, "Capex ($M)", "YoY Growth (%)",
+                         "#8c564b", "#bcbd22", "Capital Expenditure ($M) & YoY Growth", "Capex ($M)")
+        bar_with_growth(ax_shares, df_raw["Diluted_Shares_M"], df_raw["Share_Dilution_YoY_%"],
+                         "Diluted Shares (M)", "YoY Dilution (%)", "#e377c2", "#17becf",
+                         "Diluted Shares Outstanding (M) & YoY Dilution", "Shares (Millions)")
+
+        plt.tight_layout()
+        st.pyplot(fig5)
+        plt.close(fig5)
+
+        # ======================================================
+        # ROW 6 — ROIC
+        # ======================================================
+        st.markdown("---")
+        st.subheader(f"{ticker_symbol} — Return on Invested Capital")
+        if df_raw["Invested_Capital"].isna().all():
+            st.info(
+                "ROIC unavailable: SEC XBRL company facts for this ticker don't include the "
+                "balance-sheet tags (StockholdersEquity / debt / cash) this app looks for. "
+                "See the diagnostics panel above for exact concept coverage."
+            )
+
+        fig6, (ax_roic, ax_nopat) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
+
+        line_chart(ax_roic, df_raw["ROIC_%"], "ROIC, TTM (%)", "#2ca02c",
+                   "Return on Invested Capital (TTM as-of Quarter)", "ROIC (%)",
+                   marker="o", zero_line=True)
+
+        nopat_m = df_raw["NOPAT_TTM"] / 1e6
+        ic_m = df_raw["Invested_Capital_Avg"] / 1e6
+        if nopat_m.notna().any() or ic_m.notna().any():
+            ax_nopat.bar(xlabels, nopat_m, width=0.55, alpha=0.85, label="NOPAT, TTM ($M)", color="#1f77b4")
+            ax_nopat.set_title("NOPAT (TTM) vs Avg. Invested Capital", fontweight="bold", fontsize=10.5)
+            ax_nopat.set_ylabel("NOPAT ($M)")
+            ax_nopat.tick_params(axis="x", rotation=45, labelsize=7)
+
+            ax_nopat_sub = ax_nopat.twinx()
+            ic_valid = ic_m.dropna()
+            if not ic_valid.empty:
+                ax_nopat_sub.plot(xlabels[ic_valid.index], ic_valid, marker="o", color="#d62728", linewidth=1.5, label="Avg. Invested Capital ($M)")
+            ax_nopat_sub.set_ylabel("Invested Capital ($M)")
+            ax_nopat_sub.grid(False)
+
+            h1, l1 = ax_nopat.get_legend_handles_labels()
+            h2, l2 = ax_nopat_sub.get_legend_handles_labels()
+            ax_nopat.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+        else:
+            ax_nopat.set_title("NOPAT (TTM) vs Avg. Invested Capital", fontweight="bold", fontsize=10.5)
+            ax_nopat.text(0.5, 0.5, "No data available", ha="center", va="center", transform=ax_nopat.transAxes, fontsize=9, color="gray")
+
+        plt.tight_layout()
+        st.pyplot(fig6)
+        plt.close(fig6)
 
     except Exception as exc:
         st.error(f"Could not load data for ticker '{ticker_symbol}'. Error: {type(exc).__name__}: {exc}")
