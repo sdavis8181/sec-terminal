@@ -57,7 +57,7 @@ with st.sidebar:
     st.header("Terminal Controls")
 
     ticker_symbol = (
-        st.text_input("Stock Ticker", value="AXON", max_chars=12)
+        st.text_input("Stock Ticker", value="APP", max_chars=12)
         .strip()
         .upper()
     )
@@ -224,6 +224,8 @@ FLOW_CONCEPTS = {
     "Diluted_Shares": [
         "WeightedAverageNumberOfDilutedSharesOutstanding",
         "WeightedAverageNumberOfSharesOutstandingDiluted",
+        "WeightedAverageNumberOfSharesOutstandingBasic",
+        "CommonStockSharesOutstanding",
     ],
     "OCF": [
         "NetCashProvidedByUsedInOperatingActivities",
@@ -378,42 +380,32 @@ def standalone_quarter_candidates(entries):
     output = []
 
     for e in entries:
-        if not entry_is_flow(e):
-            continue
-
-        days = entry_duration_days(e)
-        if days is None:
+        end = entry_date(e, "end")
+        if pd.isna(end):
             continue
 
         form = str(e.get("form", "")).upper()
         frame = str(e.get("frame", ""))
 
-        if 70 <= days <= 110:
-            end = entry_date(e, "end")
-            score = 60
-            if form in {"10-Q", "20-F", "6-K"}:
+        # Support both Flow metrics and Instant/Balance-sheet facts (like shares)
+        if entry_is_flow(e):
+            days = entry_duration_days(e)
+            if days is not None and 70 <= days <= 110:
+                score = 60
+                if form in {"10-Q", "20-F", "6-K"}:
+                    score += 20
+                output.append({"entry": e, "period": end, "method": "duration", "score": score})
+                continue
+
+            q_end = quarter_from_frame(frame)
+            if q_end is not None:
+                output.append({"entry": e, "period": q_end, "method": "SEC frame", "score": 50})
+        else:
+            # Instantaneous balance-sheet entry (e.g. shares outstanding)
+            score = 40
+            if form in {"10-Q", "10-K"}:
                 score += 20
-
-            output.append(
-                {
-                    "entry": e,
-                    "period": end,
-                    "method": "duration",
-                    "score": score,
-                }
-            )
-            continue
-
-        q_end = quarter_from_frame(frame)
-        if q_end is not None:
-            output.append(
-                {
-                    "entry": e,
-                    "period": q_end,
-                    "method": "SEC frame",
-                    "score": 50,
-                }
-            )
+            output.append({"entry": e, "period": end, "method": "instant", "score": score})
 
     return output
 
@@ -640,7 +632,7 @@ YF_KEYS = {
     "Operating_Income": ["Operating Income", "Operating Income Loss", "EBIT"],
     "Net_Income": ["Net Income", "Net Income Common Stockholders", "Net Income Including Noncontrolling Interests"],
     "Diluted_EPS": ["Diluted EPS", "Diluted EPS From Continuing Operations"],
-    "Diluted_Shares": ["Diluted Average Shares", "Diluted Average Shares Outstanding"],
+    "Diluted_Shares": ["Diluted Average Shares", "Diluted Average Shares Outstanding", "Basic Average Shares"],
     "OCF": ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities", "Total Cash From Operating Activities"],
     "Capex": ["Capital Expenditure", "Capital Expenditure Reported", "Purchase Of Property Plant And Equipment"],
 }
@@ -736,7 +728,19 @@ def calculate_metrics(df):
     work["Op_Margin_%"] = safe_divide(work["Operating_Income"], work["Revenue"]) * 100
     work["Net_Margin_%"] = safe_divide(work["Net_Income"], work["Revenue"]) * 100
 
-    work["Diluted_Shares_M"] = work["Diluted_Shares"] / 1e6
+    # Impute missing shares via Net Income / EPS
+    implied = safe_divide(work["Net_Income"], work["Diluted_EPS"])
+    missing_shares = (
+        work["Diluted_Shares"].isna()
+        & implied.notna()
+        & (work["Diluted_EPS"].abs() > 0.005)
+        & (implied > 0)
+    )
+    work.loc[missing_shares, "Diluted_Shares"] = implied[missing_shares]
+
+    # Forward-fill and backward-fill remaining missing shares so YoY line doesn't disconnect
+    clean_shares = work["Diluted_Shares"].replace(0, np.nan).ffill().bfill()
+    work["Diluted_Shares_M"] = clean_shares / 1e6
     work["Share_Dilution_YoY_%"] = pct_change_safe(work["Diluted_Shares_M"], 4).clip(-50, 50)
 
     return work
@@ -758,10 +762,6 @@ def calculate_fcf(df):
 
 
 def calculate_trailing_flow(series):
-    """
-    Computes trailing 4-quarter sums. If fewer than 4 quarters are available
-    (e.g., IPOs or early records), annualizes based on available periods.
-    """
     s = pd.to_numeric(series, errors="coerce")
     roll_sum = s.rolling(4, min_periods=1).sum()
     roll_count = s.rolling(4, min_periods=1).count()
@@ -840,18 +840,6 @@ def fetch_and_parse_ticker(ticker, refresh_nonce=0):
 
     df = calculate_metrics(df)
 
-    implied = safe_divide(df["Net_Income"], df["Diluted_EPS"])
-    missing = (
-        df["Diluted_Shares"].isna()
-        & implied.notna()
-        & (df["Diluted_EPS"].abs() > 0.0001)
-    )
-
-    df.loc[missing, "Diluted_Shares"] = implied[missing]
-    df.loc[missing, "Diluted_Shares_Method"] = "Implied Net Income / Diluted EPS"
-    df["Diluted_Shares_M"] = df["Diluted_Shares"] / 1e6
-    df["Share_Dilution_YoY_%"] = pct_change_safe(df["Diluted_Shares_M"], 4).clip(-50, 50)
-
     return df, fact_meta, diagnostics
 
 
@@ -871,7 +859,7 @@ if run_button or ticker_symbol:
         df_fcf = calculate_fcf(df_raw)
 
         # ----------------------------------------------------
-        # TTM VALUATION (ROBUST MULTI-PERIOD ENGINE)
+        # TTM VALUATION
         # ----------------------------------------------------
 
         df_raw["TTM_Revenue"] = calculate_trailing_flow(df_raw["Revenue"])
@@ -1104,15 +1092,26 @@ if run_button or ticker_symbol:
 
         fig3, (ax_c1, ax_c2) = plt.subplots(1, 2, figsize=(16, 5), dpi=150)
 
-        ax_c1.bar(xlabels, df_raw["Capex"].abs() / 1e9, width=0.55, alpha=0.85, label="Capex ($B)")
-        ax_c1.set_title("Quarterly Capital Expenditures ($B)", fontweight="bold", fontsize=10.5)
-        ax_c1.set_ylabel("Capex ($B)")
+        # Capex ($M instead of $B to clearly resolve small tech capex)
+        ax_c1.bar(xlabels, df_raw["Capex"].abs() / 1e6, width=0.55, alpha=0.85, label="Capex ($M)")
+        ax_c1.set_title("Quarterly Capital Expenditures ($M)", fontweight="bold", fontsize=10.5)
+        ax_c1.set_ylabel("Capex ($M)")
         ax_c1.tick_params(axis="x", rotation=45, labelsize=7)
         ax_c1.legend(loc="upper left", fontsize=7)
         ax_c1.grid(True, linestyle="--", alpha=0.3)
 
-        ax_c2.plot(xlabels, df_raw["Share_Dilution_YoY_%"], marker="o", linewidth=2, label="Diluted Share Growth YoY (%)")
-        ax_c2.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
+        # Share dilution
+        valid_dilution = df_raw["Share_Dilution_YoY_%"].notna()
+        if valid_dilution.any():
+            ax_c2.plot(
+                xlabels[valid_dilution],
+                df_raw.loc[valid_dilution, "Share_Dilution_YoY_%"],
+                marker="o",
+                linewidth=2,
+                label="Diluted Share Growth YoY (%)",
+            )
+
+        ax_c2.axhline(0, linestyle=":", linewidth=1, alpha=0.6, color="red")
         ax_c2.set_title("Diluted Share Count Change — YoY %", fontweight="bold", fontsize=10.5)
         ax_c2.set_ylabel("Share Count YoY Change (%)")
         ax_c2.tick_params(axis="x", rotation=45, labelsize=7)
