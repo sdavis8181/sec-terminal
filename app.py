@@ -1488,9 +1488,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        plt.tight_layout(
-            rect=
-        )
+        plt.tight_layout(rect=)
 
         st.pyplot(fig)
         plt.close(fig)
@@ -1676,9 +1674,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        plt.tight_layout(
-            rect=
-        )
+        plt.tight_layout(rect=)
 
         st.pyplot(fig2)
         plt.close(fig2)
