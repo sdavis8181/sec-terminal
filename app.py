@@ -1265,7 +1265,7 @@ if run_button or ticker_symbol:
             "%Y-%m-%d"
         )
 
-        # Revenue
+        # Revenue (0, 0)
         ax = axes[0, 0]
         valid = df_raw["Revenue_B"].notna()
 
@@ -1322,7 +1322,7 @@ if run_button or ticker_symbol:
                 fontsize=6.5,
             )
 
-        # EPS
+        # EPS (0, 1)
         ax = axes
         valid = df_raw["Diluted_EPS"].notna()
 
@@ -1379,7 +1379,7 @@ if run_button or ticker_symbol:
                 fontsize=6.5,
             )
 
-        # FCF
+        # FCF (1, 0)
         ax = axes
         valid = df_fcf["FCF_B"].notna()
 
@@ -1440,7 +1440,7 @@ if run_button or ticker_symbol:
                 fontsize=6.5,
             )
 
-        # Margins
+        # Margins (1, 1)
         ax = axes
 
         ax.plot(
@@ -1516,7 +1516,7 @@ if run_button or ticker_symbol:
             y=0.98,
         )
 
-        # Price
+        # Price (0, 0)
         ax = axes2[0, 0]
 
         if (
@@ -1561,7 +1561,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        # P/S
+        # P/S (0, 1)
         ax = axes2
 
         if "P_S_TTM" in df_raw.columns:
@@ -1594,7 +1594,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        # P/E
+        # P/E (1, 0)
         ax = axes2
 
         if "P_E_TTM" in df_raw.columns:
@@ -1634,7 +1634,7 @@ if run_button or ticker_symbol:
             alpha=0.3,
         )
 
-        # FCF yield
+        # FCF yield (1, 1)
         ax = axes2
 
         if "FCF_Yield_%" in df_raw.columns:
@@ -1771,7 +1771,7 @@ if run_button or ticker_symbol:
 
     except Exception as exc:
         st.error(
-            f"Could not load data for ticker '{ticker_symbol}'. "
+            f"Could not load data for ticker '{ticker_symbol}. "
             f"Error: {type(exc).__name__}: {exc}"
         )
         st.exception(exc)
