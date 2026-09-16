@@ -76,8 +76,8 @@ with st.sidebar:
     st.markdown("---")
     st.caption(
         "SEC XBRL is the primary financial-statement source. "
-        "The parser uses individual XBRL facts and their actual reporting "
-        "periods instead of taking the first year-looking table column."
+        "The parser derives quarterly OCF and Capex flows from cumulative YTD filings "
+        "when standalone quarter facts are absent."
     )
 
 
@@ -234,6 +234,9 @@ FLOW_CONCEPTS = {
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PurchaseOfPropertyPlantAndEquipment",
         "PaymentsForAdditionsToPropertyPlantAndEquipment",
+        "PaymentsToAcquireProductiveAssets",
+        "PaymentsForSoftware",
+        "PaymentsToAcquireIntangibleAssets",
         "PaymentsToAcquirePropertyPlantAndEquipmentAndOtherPropertyPlantAndEquipment",
         "AdditionsToPropertyPlantAndEquipment",
     ],
@@ -385,7 +388,6 @@ def standalone_quarter_candidates(entries):
         form = str(e.get("form", "")).upper()
         frame = str(e.get("frame", ""))
 
-        # Prioritize true filing duration end-date for off-calendar filers
         if 70 <= days <= 110:
             end = entry_date(e, "end")
             score = 60
@@ -430,14 +432,111 @@ def pick_best_entry(candidates):
 
 
 # ============================================================
+# CASH FLOW YTD-TO-QUARTER DERIVATION
+# ============================================================
+
+def derive_quarterly_cashflows(entries, field):
+    """
+    Solves the 'Only Q1' SEC trap. U.S. 10-Q filings report YTD cash flows:
+    - Q1: ~90 days (direct)
+    - Q2: ~180 days -> Derived Q2 = 6M - Q1
+    - Q3: ~270 days -> Derived Q3 = 9M - 6M
+    - Q4: ~365 days -> Derived Q4 = FY - 9M
+    """
+    usable = []
+    for e in entries:
+        if not entry_is_flow(e):
+            continue
+        days = entry_duration_days(e)
+        val = clean_number(e.get("val"))
+        fy = e.get("fy")
+        fp = str(e.get("fp", "")).upper()
+        form = str(e.get("form", "")).upper()
+        end = entry_date(e, "end")
+        filed = str(e.get("filed", ""))
+
+        if days is not None and pd.notna(val) and pd.notna(end) and fy is not None:
+            usable.append({
+                "entry": e,
+                "val": val,
+                "days": days,
+                "fy": fy,
+                "fp": fp,
+                "form": form,
+                "end": end,
+                "filed": filed
+            })
+
+    if not usable:
+        return {}
+
+    df_entries = pd.DataFrame(usable).sort_values(["fy", "end", "filed"])
+    derived_quarters = {}
+
+    for fy, group in df_entries.groupby("fy"):
+        # Categorize flows by duration
+        q1_rows = group[(group["days"] >= 70) & (group["days"] <= 110)]
+        m6_rows = group[(group["days"] >= 160) & (group["days"] <= 205)]
+        m9_rows = group[(group["days"] >= 250) & (group["days"] <= 300)]
+        m12_rows = group[(group["days"] >= 340) & (group["days"] <= 385)]
+
+        # Q1: Direct
+        if not q1_rows.empty:
+            best_q1 = q1_rows.iloc[-1]
+            derived_quarters[best_q1["end"].strftime("%Y-%m-%d")] = {
+                "val": best_q1["val"],
+                "period": best_q1["end"],
+                "method": "direct Q1",
+                "entry": best_q1["entry"]
+            }
+
+        # Q2: 6M cumulative - Q1
+        if not m6_rows.empty and not q1_rows.empty:
+            best_m6 = m6_rows.iloc[-1]
+            best_q1 = q1_rows.iloc[-1]
+            val_q2 = best_m6["val"] - best_q1["val"]
+            derived_quarters[best_m6["end"].strftime("%Y-%m-%d")] = {
+                "val": val_q2,
+                "period": best_m6["end"],
+                "method": "derived (6M - Q1)",
+                "entry": best_m6["entry"]
+            }
+
+        # Q3: 9M cumulative - 6M cumulative
+        if not m9_rows.empty and not m6_rows.empty:
+            best_m9 = m9_rows.iloc[-1]
+            best_m6 = m6_rows.iloc[-1]
+            val_q3 = best_m9["val"] - best_m6["val"]
+            derived_quarters[best_m9["end"].strftime("%Y-%m-%d")] = {
+                "val": val_q3,
+                "period": best_m9["end"],
+                "method": "derived (9M - 6M)",
+                "entry": best_m9["entry"]
+            }
+
+        # Q4: 12M annual - 9M cumulative
+        if not m12_rows.empty and not m9_rows.empty:
+            best_m12 = m12_rows.iloc[-1]
+            best_m9 = m9_rows.iloc[-1]
+            val_q4 = best_m12["val"] - best_m9["val"]
+            derived_quarters[best_m12["end"].strftime("%Y-%m-%d")] = {
+                "val": val_q4,
+                "period": best_m12["end"],
+                "method": "derived (12M - 9M)",
+                "entry": best_m12["entry"]
+            }
+
+    return derived_quarters
+
+
+# ============================================================
 # DEDUPLICATOR & SNAP ENGINE
 # ============================================================
 
 def collapse_duplicate_quarters(df, tolerance_days=45):
     """
-    Collapses quarter entries within 45 days of each other (such as Yahoo's 03-31
-    and Rubrik's fiscal 04-30) into one single period, giving full priority to
-    SEC-sourced values over Yahoo values.
+    Collapses quarter entries within 45 days of each other into a single period,
+    giving preference to SEC-reported values over fallback values.
     """
     if df.empty or "Period" not in df.columns:
         return df
@@ -451,7 +550,6 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
         p = row["Period"]
         placed = False
         for cluster in clusters:
-            # Check proximity to any date already in the cluster
             if any(abs((p - existing["Period"]).days) <= tolerance_days for existing in cluster):
                 cluster.append(row)
                 placed = True
@@ -461,30 +559,25 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
 
     unified_rows = []
     for cluster in clusters:
-        # Prefer the SEC record for determining the canonical quarter-end date
         sec_rows = [r for r in cluster if "SEC" in str(r.get("Source", ""))]
         canonical_row = sec_rows[-1] if sec_rows else cluster[-1]
         canonical_period = canonical_row["Period"]
 
         merged_record = {"Period": canonical_period}
-        
-        # Combine non-null values, giving preference to SEC entries
+
         for col in df.columns:
             if col == "Period":
                 continue
             val = np.nan
-            # 1. Search SEC rows in cluster
             for r in sec_rows:
                 if pd.notna(r.get(col)):
                     val = r[col]
-            # 2. If still NaN, search Yahoo rows
             if pd.isna(val):
                 for r in cluster:
                     if pd.notna(r.get(col)):
                         val = r[col]
             merged_record[col] = val
 
-        # Set final combined source
         sources = {str(r.get("Source", "")) for r in cluster if pd.notna(r.get("Source"))}
         if any("SEC" in s for s in sources) and any("Yahoo" in s for s in sources):
             merged_record["Source"] = "SEC + Yahoo"
@@ -495,8 +588,7 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
 
         unified_rows.append(merged_record)
 
-    out_df = pd.DataFrame(unified_rows).sort_values("Period").reset_index(drop=True)
-    return out_df
+    return pd.DataFrame(unified_rows).sort_values("Period").reset_index(drop=True)
 
 
 # ============================================================
@@ -515,10 +607,19 @@ def build_quarterly_fact_table(companyfacts):
             continue
 
         fact_meta[field] = meta
-
         entries = meta["entries"]
-        candidates = standalone_quarter_candidates(entries)
 
+        # If metric is OCF or Capex, derive across YTD periods to resolve the Q2-Q4 missing trap
+        if field in {"OCF", "Capex"}:
+            derived_map = derive_quarterly_cashflows(entries, field)
+            for key, item in derived_map.items():
+                quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
+                quarter_rows[key][field] = item["val"]
+                quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
+                quarter_rows[key][f"{field}_Method"] = item["method"]
+
+        # Standard processing for standalone quarterly facts (and fallback for direct cash flows)
+        candidates = standalone_quarter_candidates(entries)
         grouped = {}
         for item in candidates:
             period = item["period"]
@@ -533,17 +634,13 @@ def build_quarterly_fact_table(companyfacts):
                 continue
 
             entry = best["entry"]
-            quarter_rows.setdefault(
-                key,
-                {
-                    "Period": best["period"],
-                    "Source": "SEC XBRL",
-                },
-            )
-
-            quarter_rows[key][field] = clean_number(entry.get("val"))
-            quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
-            quarter_rows[key][f"{field}_Method"] = best["method"]
+            quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
+            
+            # Prioritize direct standalone fact if not already set by derivation
+            if field not in quarter_rows[key] or pd.isna(quarter_rows[key][field]):
+                quarter_rows[key][field] = clean_number(entry.get("val"))
+                quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
+                quarter_rows[key][f"{field}_Method"] = best["method"]
 
     df = pd.DataFrame(list(quarter_rows.values()))
 
@@ -630,7 +727,6 @@ def merge_sec_yahoo(sec_df, yahoo_df):
     if yahoo_df.empty:
         return sec_df.copy()
 
-    # Combine both datasets and apply the cluster-snapping deduplicator
     combined = pd.concat([sec_df, yahoo_df], ignore_index=True)
     return collapse_duplicate_quarters(combined, tolerance_days=45)
 
@@ -673,9 +769,12 @@ def calculate_fcf(df):
 
     work["OCF"] = pd.to_numeric(work["OCF"], errors="coerce")
     work["Capex"] = pd.to_numeric(work["Capex"], errors="coerce")
-    work["Capex_Positive"] = work["Capex"].abs()
+    
+    # Ad-tech/asset-light companies may report 0 or omit Capex
+    work["Capex_Positive"] = work["Capex"].abs().fillna(0.0)
 
-    work["FCF"] = work["OCF"] - work["Capex_Positive"]
+    # Calculate FCF when OCF is available
+    work["FCF"] = np.where(work["OCF"].notna(), work["OCF"] - work["Capex_Positive"], np.nan)
     work["FCF_B"] = work["FCF"] / 1e9
     work["FCF_YoY_%"] = pct_change_safe(work["FCF"], 4).clip(-500, 500)
     work["FCF_QoQ_%"] = pct_change_safe(work["FCF"], 1).clip(-500, 500)
@@ -776,7 +875,6 @@ def fetch_and_parse_ticker(ticker, refresh_nonce=0):
 
 if run_button or ticker_symbol:
     try:
-        # Nonce flips on force refresh to guarantee cache bust
         nonce = np.random.randint(1, 1000000) if force_refresh else 0
 
         with st.spinner(f"Loading SEC XBRL and market data for {ticker_symbol}..."):
@@ -984,14 +1082,13 @@ if run_button or ticker_symbol:
 
         # P/E
         if "P_E_TTM" in df_raw.columns:
-            ax_p2_pe = ax_p3
-            ax_p2_pe.plot(xlabels, df_raw["P_E_TTM"], marker="s", linewidth=2, label="P/E (TTM)")
-            ax_p2_pe.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
-            ax_p2_pe.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
-            ax_p2_pe.set_ylabel("P/E Multiple (x)")
-            ax_p2_pe.tick_params(axis="x", rotation=45, labelsize=7)
-            ax_p2_pe.legend(loc="upper left", fontsize=7)
-            ax_p2_pe.grid(True, linestyle="--", alpha=0.3)
+            ax_p3.plot(xlabels, df_raw["P_E_TTM"], marker="s", linewidth=2, label="P/E (TTM)")
+            ax_p3.axhline(0, linestyle=":", linewidth=1, alpha=0.6)
+            ax_p3.set_title("Price-to-Earnings (P/E) — TTM", fontweight="bold", fontsize=10.5)
+            ax_p3.set_ylabel("P/E Multiple (x)")
+            ax_p3.tick_params(axis="x", rotation=45, labelsize=7)
+            ax_p3.legend(loc="upper left", fontsize=7)
+            ax_p3.grid(True, linestyle="--", alpha=0.3)
 
         # FCF yield
         if "FCF_Yield_%" in df_raw.columns:
