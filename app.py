@@ -78,7 +78,9 @@ with st.sidebar:
     st.caption(
         "Direct 3-month standalone quarterly reports take precedence, with "
         "cumulative flow subtractions ($6\\text{M}-3\\text{M}$, $9\\text{M}-6\\text{M}$, "
-        "$12\\text{M}-9\\text{M}$) backing out standalone Q4 numbers across changing taxonomy tags."
+        "$12\\text{M}-9\\text{M}$) backing out standalone Q4 numbers across changing taxonomy tags. "
+        "All periods are then snapped onto a strict calendar-quarter grid so YoY/TTM math never "
+        "silently bridges a missing quarter."
     )
 
 # ============================================================
@@ -122,6 +124,25 @@ def pct_change_safe(series, periods):
 
 def as_date(value):
     return pd.to_datetime(value, errors="coerce")
+
+
+def canonical_quarter_end(date):
+    """
+    Snap any date onto the calendar-quarter-end grid (3/31, 6/30, 9/30, 12/31).
+
+    Different XBRL concepts (Revenue vs OCF vs EPS, etc.) frequently report the
+    "same" quarter with end dates that differ by a day or two (fiscal calendar
+    rounding, 52/53-week quirks, restatement filings). Left as-is, those near
+    duplicates land in different rows of the fact table, so one field ends up
+    populated and another ends up NaN for what is really the same quarter -
+    this is the main reason the Revenue series had holes that other fields
+    didn't. Canonicalizing every period onto the same quarter-end key forces
+    all fields for one true fiscal quarter to merge into a single row.
+    """
+    d = pd.Timestamp(date)
+    if pd.isna(d):
+        return pd.NaT
+    return d.to_period("Q").end_time.normalize()
 
 
 # ============================================================
@@ -175,6 +196,7 @@ FLOW_CONCEPTS = {
         "Revenues",
         "SalesRevenueNet",
         "SalesRevenueGoodsNet",
+        "SalesRevenueServicesNet",
         "Revenue",
     ],
     "Operating_Income": [
@@ -351,29 +373,44 @@ def pick_best_entry(candidates):
 
 
 def derive_quarterly_flows(entries, field):
+    """
+    Backs out standalone quarters (especially Q4) from cumulative YTD facts:
+    Q1 = direct 3M figure, Q2 = 6M - Q1, Q3 = 9M - 6M, Q4 = 12M - 9M.
+
+    IMPORTANT FIX: this used to group entries by the SEC-provided "fy" tag.
+    That tag describes the *filing's own* fiscal-year context, not the actual
+    period the fact covers - the exact same fact often reappears in a later
+    filing (as a prior-year comparative) tagged with a *different* fy value.
+    Grouping on "fy" therefore scattered a single fiscal year's Q1/6M/9M/12M
+    figures across multiple buckets, so the subtraction logic silently failed
+    and produced holes (this was the main cause of the missing Revenue
+    quarters). Every duration within one fiscal year (Q1, 6M, 9M, 12M) shares
+    the exact same period *start* date, so we group on that instead - it's a
+    property of the period itself, not of whichever filing happened to report it.
+    """
     usable = []
     for e in entries:
         if "start" not in e or "end" not in e:
             continue
         days = entry_duration_days(e)
         val = clean_number(e.get("val"))
-        fy = e.get("fy")
+        start = entry_date(e, "start")
         end = entry_date(e, "end")
         filed = str(e.get("filed", ""))
 
-        if days is not None and pd.notna(val) and pd.notna(end) and fy is not None:
+        if days is not None and pd.notna(val) and pd.notna(start) and pd.notna(end):
             usable.append({
-                "entry": e, "val": val, "days": days, "fy": fy,
-                "end": end, "filed": filed
+                "entry": e, "val": val, "days": days,
+                "start": start, "end": end, "filed": filed
             })
 
     if not usable:
         return {}
 
-    df_entries = pd.DataFrame(usable).sort_values(["fy", "end", "filed"])
+    df_entries = pd.DataFrame(usable).sort_values(["start", "end", "filed"])
     derived = {}
 
-    for fy, group in df_entries.groupby("fy"):
+    for _, group in df_entries.groupby("start"):
         q1_rows = group[(group["days"] >= 70) & (group["days"] <= 110)]
         m6_rows = group[(group["days"] >= 160) & (group["days"] <= 205)]
         m9_rows = group[(group["days"] >= 250) & (group["days"] <= 300)]
@@ -381,22 +418,25 @@ def derive_quarterly_flows(entries, field):
 
         if not q1_rows.empty:
             q1 = q1_rows.iloc[-1]
-            derived[q1["end"].strftime("%Y-%m-%d")] = {
-                "val": q1["val"], "period": q1["end"], "method": "direct Q1", "entry": q1["entry"]
+            key = canonical_quarter_end(q1["end"])
+            derived[key.strftime("%Y-%m-%d")] = {
+                "val": q1["val"], "period": key, "method": "direct Q1", "entry": q1["entry"]
             }
 
         if not m6_rows.empty and not q1_rows.empty:
             m6 = m6_rows.iloc[-1]
             q1 = q1_rows.iloc[-1]
-            derived[m6["end"].strftime("%Y-%m-%d")] = {
-                "val": m6["val"] - q1["val"], "period": m6["end"], "method": "derived (6M - Q1)", "entry": m6["entry"]
+            key = canonical_quarter_end(m6["end"])
+            derived[key.strftime("%Y-%m-%d")] = {
+                "val": m6["val"] - q1["val"], "period": key, "method": "derived (6M - Q1)", "entry": m6["entry"]
             }
 
         if not m9_rows.empty and not m6_rows.empty:
             m9 = m9_rows.iloc[-1]
             m6 = m6_rows.iloc[-1]
-            derived[m9["end"].strftime("%Y-%m-%d")] = {
-                "val": m9["val"] - m6["val"], "period": m9["end"], "method": "derived (9M - 6M)", "entry": m9["entry"]
+            key = canonical_quarter_end(m9["end"])
+            derived[key.strftime("%Y-%m-%d")] = {
+                "val": m9["val"] - m6["val"], "period": key, "method": "derived (9M - 6M)", "entry": m9["entry"]
             }
 
         if not m12_rows.empty:
@@ -408,8 +448,9 @@ def derive_quarterly_flows(entries, field):
                 val_q4 = m12["val"] - m6_rows.iloc[-1]["val"]
 
             if pd.notna(val_q4):
-                derived[m12["end"].strftime("%Y-%m-%d")] = {
-                    "val": val_q4, "period": m12["end"], "method": "derived Q4 (12M - 9M)", "entry": m12["entry"]
+                key = canonical_quarter_end(m12["end"])
+                derived[key.strftime("%Y-%m-%d")] = {
+                    "val": val_q4, "period": key, "method": "derived Q4 (12M - 9M)", "entry": m12["entry"]
                 }
 
     return derived
@@ -472,6 +513,36 @@ def collapse_duplicate_quarters(df, tolerance_days=45):
     return pd.DataFrame(unified_rows).sort_values("Period").reset_index(drop=True)
 
 
+def reindex_to_quarterly(df):
+    """
+    Snap the merged fact table onto a *strict, gap-explicit* calendar-quarter
+    grid (one row per quarter-end, from the earliest to the latest period).
+
+    Without this, a fiscal quarter with no data at all simply doesn't exist as
+    a row, so pandas' pct_change(periods=4) and rolling(4) window operations
+    silently compare/sum whatever rows *are* present - even if they aren't
+    actually 4 consecutive quarters apart. That's what made the P/S (and P/E,
+    FCF yield) charts "skip" periods and show misleading TTM figures instead
+    of a clean gap: the rolling window was quietly bridging over a hole. Once
+    every real quarter has an explicit (possibly all-NaN) row, TTM/YoY math
+    only ever operates over genuinely consecutive quarters.
+    """
+    if df.empty or "Period" not in df.columns:
+        return df
+
+    df = df.copy()
+    df["Period"] = pd.to_datetime(df["Period"], errors="coerce")
+    df = df.dropna(subset=["Period"]).sort_values("Period")
+
+    full_index = pd.date_range(start=df["Period"].min(), end=df["Period"].max(), freq="Q")
+    df = df.set_index("Period").reindex(full_index).rename_axis("Period").reset_index()
+
+    if "Source" in df.columns:
+        df["Source"] = df["Source"].fillna("No filing found")
+
+    return df
+
+
 def build_quarterly_fact_table(companyfacts):
     fact_meta = {}
     quarter_rows = {}
@@ -502,17 +573,19 @@ def build_quarterly_fact_table(companyfacts):
             if best is None:
                 continue
             entry = best["entry"]
-            quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
-            quarter_rows[key][field] = clean_number(entry.get("val"))
-            quarter_rows[key][f"{field}_Concept"] = f"{entry.get('taxonomy')}:{entry.get('concept')}"
-            quarter_rows[key][f"{field}_Method"] = best["method"]
+            canon_period = canonical_quarter_end(best["period"])
+            canon_key = canon_period.strftime("%Y-%m-%d")
+            quarter_rows.setdefault(canon_key, {"Period": canon_period, "Source": "SEC XBRL"})
+            quarter_rows[canon_key][field] = clean_number(entry.get("val"))
+            quarter_rows[canon_key][f"{field}_Concept"] = f"{entry.get('taxonomy')}:{entry.get('concept')}"
+            quarter_rows[canon_key][f"{field}_Method"] = best["method"]
 
         # Step 2: Backfill missing quarters (e.g., Q4 or cumulative filers) via flow derivation
         if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
             derived_map = derive_quarterly_flows(entries, field)
             for key, item in derived_map.items():
                 quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
-                if field not in quarter_rows[key] or pd.isna(quarter_rows[key][field]):
+                if field not in quarter_rows[key] or pd.isna(quarter_rows[key].get(field)):
                     quarter_rows[key][field] = item["val"]
                     quarter_rows[key][f"{field}_Concept"] = f"{item['entry'].get('taxonomy')}:{item['entry'].get('concept')}"
                     quarter_rows[key][f"{field}_Method"] = item["method"]
@@ -685,6 +758,9 @@ def fetch_and_parse_ticker(ticker, refresh_nonce=0):
 
     combined = pd.concat([sec_df, yahoo_df], ignore_index=True)
     df = collapse_duplicate_quarters(combined, tolerance_days=45)
+    # Snap onto a gap-explicit quarterly calendar BEFORE any YoY/TTM math is
+    # computed, so pct_change/rolling never silently bridge a missing quarter.
+    df = reindex_to_quarterly(df)
     df = calculate_metrics(df)
 
     return df, fact_meta, diagnostics
@@ -908,6 +984,56 @@ if ticker_symbol:
         plt.tight_layout()
         st.pyplot(fig2)
         plt.close(fig2)
+
+        # ----------------------------------------------------
+        # CHARTS: CAPITAL STRUCTURE — SHARES & CAPEX (re-added)
+        # ----------------------------------------------------
+        st.markdown("---")
+        st.subheader(f"{ticker_symbol} — Capital Structure & Investment")
+
+        fig3, (ax5, ax6) = plt.subplots(1, 2, figsize=(16, 5.5), dpi=150)
+        fig3.suptitle(f"{ticker_symbol} Share Count & Capital Expenditure", fontsize=14, fontweight="bold", y=1.03)
+
+        # 5. Diluted Shares Outstanding & YoY Dilution
+        if df_raw["Diluted_Shares_M"].notna().any():
+            ax5.bar(xlabels, df_raw["Diluted_Shares_M"], width=0.55, alpha=0.85, label="Diluted Shares (M)", color="#e377c2")
+            ax5.set_title("Diluted Shares Outstanding (M) & YoY Dilution", fontweight="bold", fontsize=10.5)
+            ax5.set_ylabel("Shares (Millions)")
+            ax5.tick_params(axis="x", rotation=45, labelsize=7)
+
+            ax5_sub = ax5.twinx()
+            yoy_dil = df_raw["Share_Dilution_YoY_%"].dropna()
+            if not yoy_dil.empty:
+                ax5_sub.plot(xlabels[yoy_dil.index], yoy_dil, marker="o", color="#17becf", linewidth=1.5, label="YoY Dilution (%)")
+            ax5_sub.set_ylabel("Dilution (%)")
+            ax5_sub.grid(False)
+
+            h1, l1 = ax5.get_legend_handles_labels()
+            h2, l2 = ax5_sub.get_legend_handles_labels()
+            ax5.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+
+        # 6. Capex & YoY Growth
+        if df_raw["Capex_Positive"].notna().any():
+            capex_m = df_raw["Capex_Positive"] / 1e6
+            ax6.bar(xlabels, capex_m, width=0.55, alpha=0.85, label="Capex ($M)", color="#8c564b")
+            ax6.set_title("Capital Expenditure ($M) & YoY Growth", fontweight="bold", fontsize=10.5)
+            ax6.set_ylabel("Capex ($M)")
+            ax6.tick_params(axis="x", rotation=45, labelsize=7)
+
+            ax6_sub = ax6.twinx()
+            capex_yoy = pct_change_safe(df_raw["Capex_Positive"], 4).clip(-500, 500).dropna()
+            if not capex_yoy.empty:
+                ax6_sub.plot(xlabels[capex_yoy.index], capex_yoy, marker="o", color="#bcbd22", linewidth=1.5, label="YoY Growth (%)")
+            ax6_sub.set_ylabel("Growth (%)")
+            ax6_sub.grid(False)
+
+            h1, l1 = ax6.get_legend_handles_labels()
+            h2, l2 = ax6_sub.get_legend_handles_labels()
+            ax6.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=7)
+
+        plt.tight_layout()
+        st.pyplot(fig3)
+        plt.close(fig3)
 
     except Exception as exc:
         st.error(f"Could not load data for ticker '{ticker_symbol}'. Error: {type(exc).__name__}: {exc}")
