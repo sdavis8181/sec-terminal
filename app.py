@@ -315,7 +315,7 @@ def choose_unit_name(concept_data, field):
         return None
 
     if field == "Diluted_EPS":
-        for unit in ["USD/shares", "USD / shares", "EUR/shares"]:
+        for unit in ["USD/shares", "USD / shares", "EUR/shares", "ARS/shares"]:
             if unit in units:
                 return unit
 
