@@ -58,7 +58,7 @@ with st.sidebar:
 
     with st.form(key="terminal_controls"):
         ticker_symbol = (
-            st.text_input("Stock Ticker", value="AAPL", max_chars=12)
+            st.text_input("Stock Ticker", value="TMDX", max_chars=12)
             .strip()
             .upper()
         )
@@ -76,8 +76,9 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption(
-        "Flows are derived from YTD statements ($6\\text{M}-3\\text{M}$, $9\\text{M}-6\\text{M}$, "
-        "$12\\text{M}-9\\text{M}$) to accurately back out standalone Q4 numbers."
+        "Direct 3-month standalone quarterly reports take precedence, with "
+        "cumulative flow subtractions ($6\\text{M}-3\\text{M}$, $9\\text{M}-6\\text{M}$, "
+        "$12\\text{M}-9\\text{M}$) backing out standalone Q4 numbers across changing taxonomy tags."
     )
 
 # ============================================================
@@ -263,21 +264,27 @@ def choose_unit_name(concept_data, field):
     return next(iter(units.keys())) if len(units) == 1 else None
 
 
-def get_preferred_entries(companyfacts, field):
-    for taxonomy, concept, concept_data in all_fact_candidates(companyfacts, field):
+def get_all_usable_entries(companyfacts, field):
+    """
+    Collects entries across all valid taxonomy concepts to handle concept shifts
+    between fiscal years and reporting periods.
+    """
+    candidates = all_fact_candidates(companyfacts, field)
+    all_entries = []
+
+    for taxonomy, concept, concept_data in candidates:
         unit = choose_unit_name(concept_data, field)
         if not unit:
             continue
         entries = concept_data["units"].get(unit, [])
-        usable = [x for x in entries if isinstance(x, dict) and "val" in x]
-        if usable:
-            return {
-                "taxonomy": taxonomy,
-                "concept": concept,
-                "unit": unit,
-                "entries": usable,
-            }
-    return None
+        usable = [
+            dict(x, taxonomy=taxonomy, concept=concept, unit=unit)
+            for x in entries
+            if isinstance(x, dict) and "val" in x
+        ]
+        all_entries.extend(usable)
+
+    return all_entries
 
 
 def entry_date(entry, key):
@@ -470,22 +477,18 @@ def build_quarterly_fact_table(companyfacts):
     quarter_rows = {}
 
     for field in FLOW_FIELDS:
-        meta = get_preferred_entries(companyfacts, field)
-        if not meta:
+        entries = get_all_usable_entries(companyfacts, field)
+        if not entries:
             fact_meta[field] = None
             continue
 
-        fact_meta[field] = meta
-        entries = meta["entries"]
+        fact_meta[field] = {
+            "taxonomy": entries[0]["taxonomy"],
+            "concept": entries[0]["concept"],
+            "unit": entries[0]["unit"],
+        }
 
-        if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
-            derived_map = derive_quarterly_flows(entries, field)
-            for key, item in derived_map.items():
-                quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
-                quarter_rows[key][field] = item["val"]
-                quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
-                quarter_rows[key][f"{field}_Method"] = item["method"]
-
+        # Step 1: Populate direct standalone 3-month reported quarters
         candidates = standalone_quarter_candidates(entries)
         grouped = {}
         for item in candidates:
@@ -501,8 +504,18 @@ def build_quarterly_fact_table(companyfacts):
             entry = best["entry"]
             quarter_rows.setdefault(key, {"Period": best["period"], "Source": "SEC XBRL"})
             quarter_rows[key][field] = clean_number(entry.get("val"))
-            quarter_rows[key][f"{field}_Concept"] = f"{meta['taxonomy']}:{meta['concept']}"
+            quarter_rows[key][f"{field}_Concept"] = f"{entry.get('taxonomy')}:{entry.get('concept')}"
             quarter_rows[key][f"{field}_Method"] = best["method"]
+
+        # Step 2: Backfill missing quarters (e.g., Q4 or cumulative filers) via flow derivation
+        if field in {"OCF", "Capex", "Revenue", "Operating_Income", "Net_Income"}:
+            derived_map = derive_quarterly_flows(entries, field)
+            for key, item in derived_map.items():
+                quarter_rows.setdefault(key, {"Period": item["period"], "Source": "SEC XBRL"})
+                if field not in quarter_rows[key] or pd.isna(quarter_rows[key][field]):
+                    quarter_rows[key][field] = item["val"]
+                    quarter_rows[key][f"{field}_Concept"] = f"{item['entry'].get('taxonomy')}:{item['entry'].get('concept')}"
+                    quarter_rows[key][f"{field}_Method"] = item["method"]
 
     df = pd.DataFrame(list(quarter_rows.values()))
     if df.empty:
@@ -627,7 +640,6 @@ def fetch_market_data(ticker):
         shares_outstanding = info.get("sharesOutstanding")
         market_cap = info.get("marketCap")
 
-        # Fetch up to 10y daily history for historical multiple tracking
         hist = tk.history(period="10y", auto_adjust=False)
 
         if hist is not None and not hist.empty:
@@ -699,7 +711,6 @@ if ticker_symbol:
         df_raw["TTM_EPS"] = calculate_trailing_flow_strict(df_raw["Diluted_EPS"])
         df_raw["TTM_FCF"] = calculate_trailing_flow_strict(df_raw["FCF"])
 
-        # Map each quarterly period end to the historical stock price at that date
         if hist_price is not None and not hist_price.empty:
             prices_at_quarter = []
             for q_date in df_raw["Period"]:
@@ -709,7 +720,6 @@ if ticker_symbol:
         else:
             df_raw["Historical_Close"] = np.nan
 
-        # Calculate True Point-In-Time Historical Multiples
         df_raw["P_E_TTM"] = safe_divide(df_raw["Historical_Close"], df_raw["TTM_EPS"]).where(df_raw["TTM_EPS"] > 0).clip(0, 250)
         implied_hist_cap = df_raw["Historical_Close"] * (df_raw["Diluted_Shares_M"] * 1e6)
         df_raw["P_S_TTM"] = safe_divide(implied_hist_cap, df_raw["TTM_Revenue"]).clip(0, 150)
