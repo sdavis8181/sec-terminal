@@ -534,7 +534,7 @@ def reindex_to_quarterly(df):
     df["Period"] = pd.to_datetime(df["Period"], errors="coerce")
     df = df.dropna(subset=["Period"]).sort_values("Period")
 
-    full_index = pd.date_range(start=df["Period"].min(), end=df["Period"].max(), freq="Q")
+    full_index = pd.date_range(start=df["Period"].min(), end=df["Period"].max(), freq="QE")
     df = df.set_index("Period").reindex(full_index).rename_axis("Period").reset_index()
 
     if "Source" in df.columns:
